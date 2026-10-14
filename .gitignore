@@ -1,0 +1,16 @@
+# The reverse map holds every secret that went in. It must never reach a repo, a tarball or a chat.
+_map.json
+*.map.json
+_out.txt
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Project memory, not product. Same convention as the other published trees.
+AGENTS.md
