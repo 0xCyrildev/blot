@@ -1,5 +1,7 @@
 """blot's own tests: every detector, and the four things that would make it dangerous to trust."""
+import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -78,6 +80,10 @@ class TestDetectors(unittest.TestCase):
         self.assertIn("db.internal:5432/app", out, "the host is what makes a log line useful")
         self.assertNotIn("Sup3rS3cret", out)
         self.assertNotIn("admin:", out)
+        # And it has to be counted and in the label table: a URL credential that never reaches
+        # --map makes that file a partial list while still claiming to be the inverse.
+        self.assertEqual(b.counts.get("URLCREDENTIALS"), 1, b.counts)
+        self.assertEqual(list(b.labels.values()), ["<URLCREDENTIALS:1>"])
 
     def test_key_name_survives_so_the_report_is_still_readable(self):
         b = blot.Blotter()
@@ -400,6 +406,86 @@ class TestEntropyGate(unittest.TestCase):
         out, _ = blot.Blotter(paranoid=True).blot_line(line)
         self.assertIn(self.SHA, out, "the sha beside `commit` must survive")
         self.assertIn("<ENTROPY", out, "a hex value 400 chars from `commit` is not a git sha")
+
+
+class TestAgentSurface(unittest.TestCase):
+    """--rules, --candidates and --json are how an agent drives blot. The property that matters:
+    the report describes what survived without ever quoting it, so reading the report is not a
+    second leak."""
+
+    STRIPE_VALUE = "sk_" + "live_" + "a" * 24   # assembled, as above: a shape this valid is valid
+    LEAKY = ("stripe_key=%s\n" % STRIPE_VALUE
+             + "MY_INTERNAL_KEY=zzzQQQQqqqzzzQQQQqqqqzzzz\n"
+               "acct=4111 1111 1111 1111\n")
+    SECRETS = (STRIPE_VALUE, "zzzQQQQqqqzzzQQQQqqqqzzzz", "4111 1111 1111 1111",
+               "4111111111111111")
+
+    def _rules(self, doc):
+        path = os.path.join(HERE, "_rules.json")
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        return path
+
+    def test_a_custom_rule_blots_and_verify_still_passes(self):
+        path = self._rules({"rules": [{
+            "name": "INTERNAL_KEY", "screen": ["internal"],
+            "regex": r"(?i)(?P<keep>\b[\w.\-]*internal[\w.\-]*\s*[:=]\s*)(?P<sec>\S{6,})"}]})
+        try:
+            rc, out, err = run("--rules", path, "--verify", stdin=self.LEAKY)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("<INTERNAL_KEY:1>", out)
+            self.assertNotIn("zzzQQQQ", out)
+        finally:
+            os.remove(path)
+
+    def test_a_bad_custom_rule_is_refused_rather_than_skipped(self):
+        path = self._rules([{"name": "X", "regex": "(?P<nope>a)"}])
+        try:
+            rc, out, err = run("--rules", path, stdin="x\n")
+            self.assertEqual(rc, 2, err)
+            self.assertIn("(?P<sec>", err)
+        finally:
+            os.remove(path)
+
+    def test_a_placeholder_from_a_rule_named_with_an_underscore_survives_later_rules(self):
+        rules = [("MY_KEY", re.compile(r"(?i)(?P<keep>my_secret\s*[:=]\s*)(?P<sec>\S{6,})"), ())]
+        b = blot.Blotter(rules=rules)
+        out, _ = b.blot_line("my_secret=hunter2secretvalue")
+        self.assertEqual(out, "my_secret=<MY_KEY:1>")
+        self.assertEqual(b.blot_line(out)[0], out, "a placeholder was blotted a second time")
+
+    def test_candidates_describe_survivors_without_quoting_them(self):
+        rc, out, err = run("--candidates", "--json", "--out", os.devnull, stdin=self.LEAKY)
+        self.assertEqual(rc, 0, err)
+        doc = json.loads(out)
+        kinds = {c["kind"] for c in doc["candidates"]}
+        self.assertIn("named", kinds, "a *_KEY= site nobody recognised went unreported")
+        self.assertIn("card", kinds, "a Luhn-valid PAN went unreported")
+        blob = json.dumps(doc)
+        for secret in self.SECRETS:
+            self.assertNotIn(secret, blob, "the report quoted a live secret")
+
+    def test_the_json_report_counts_and_locates_without_leaving_the_map_behind(self):
+        rc, out, err = run("--json", "--out", os.devnull, stdin=self.LEAKY)
+        self.assertEqual(rc, 0, err)
+        doc = json.loads(out)
+        self.assertEqual(doc["by_type"], {"STRIPE": 1})
+        self.assertEqual(doc["findings"], [{"line": 1, "type": "STRIPE", "label": "<STRIPE:1>"}])
+        self.assertNotIn("sk_live", json.dumps(doc))
+
+    def test_dump_rules_round_trips_back_through_rules(self):
+        path = os.path.join(HERE, "_dump.json")
+        rc, _o, err = run("--dump-rules", path)
+        try:
+            self.assertEqual(rc, 0, err)
+            with open(path) as fh:
+                doc = json.load(fh)
+            self.assertTrue(any(r["name"] == "KV" for r in doc["rules"]))
+            rc2, out2, err2 = run("--rules", path, stdin=self.LEAKY)
+            self.assertEqual(rc2, 0, err2)
+            self.assertIn("<STRIPE:1>", out2)
+        finally:
+            os.remove(path)
 
 
 class TestCli(unittest.TestCase):

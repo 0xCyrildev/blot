@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blot"
-version = "1.0.0"
+version = "1.1.0"
 description = "Take the live secrets out of text before you show it to anyone"
 readme = "README.md"
 requires-python = ">=3.9"

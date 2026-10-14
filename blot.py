@@ -11,6 +11,15 @@ No network, no config, no telemetry. Stdlib only, one file.
   cargo build --verbose 2>&1 | blot > safe-log.txt
   blot draft.md --out draft.published.md --map draft.map.json    # the map is the only copy (0600)
   cat transcript.txt | blot --verify > /dev/null                 # exits 3 if anything survived
+
+Detection is by shape and by name, so the long tail is somebody's in-house key. That tail is handled
+by a reviewer rather than by a network call: `--candidates` reports what survived redaction, described
+and never quoted, `--rules FILE` teaches blot the shapes that reviewer named, and `--json` lets the
+whole loop be driven by an agent that is never shown a secret. `--dump-rules FILE` starts from the
+built-in set instead of from nothing.
+
+  blot app.log --json --candidates --out app.safe.txt   # an agent reads the report, not the log
+  blot app.log --rules learned.json --verify            # ...and blot applies what it decided
 """
 import argparse
 import hashlib
@@ -18,10 +27,11 @@ import json
 import math
 import os
 import re
+import string
 import sys
 
 PROG = os.path.basename(sys.argv[0]).split(".")[0]
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Named groups: `keep` is the context that stays visible (so a reader can still tell WHICH field was
 # blotted), `sec` is the secret, `q`/`tail` preserve quoting. Order matters: specific prefixed forms
@@ -120,10 +130,68 @@ CTX_WINDOW = 48
 # A value at a key/quote/--flag= site is blotted by the last-resort rule above this many bits per
 # character. 3.0 spare bits is roughly "not English, not a version number, not a git sha".
 PARANOID_MIN_BITS = 3.0
-LABEL_INNER = re.compile(r"<[A-Z]+:[^>]*>?", re.I)
+# --json lists every blot, which on a log where every line carries a secret would otherwise grow
+# without bound. Past this the report says so rather than lying by omission.
+MAX_FINDINGS = 20000
+# A placeholder, tolerant of being cut off mid-label, because a later rule can match inside one.
+# The type name has to allow what --rules allows: an earlier version matched only <[A-Z]+:, so the
+# placeholder left by a rule named INTERNAL_KEY was not recognised as a placeholder and got blotted
+# a second time, corrupting the one token that points back to the secret.
+LABEL_INNER = re.compile(r"<[A-Z][A-Z0-9_]*(?::[^>\s]*)?>?", re.I)
+# A label with 16+ credential-shaped characters still glued to it: `<JWT:1>eyJhbGciOiJI...` is what a
+# half-redacted secret looks like, and verify must not be fooled by the label in front of it.
+LABEL_TAIL = re.compile(r"<[A-Z][A-Z0-9_]*:[^>]*>[^\s<]*[A-Za-z0-9_/+\-]{16,}")
 
 
 ALL_TYPES = {t for t, _, _ in RULES} | {t for t, _, _ in PII} | {"PRIVKEY", "SEEDPHRASE", "ENTROPY"}
+
+# --- candidate sweep -----------------------------------------------------------------------------
+# What an agent looks at: everything that survived redaction and still *shaped* like a secret. The
+# sweep runs on the blotted line, so by construction it never sees what a rule already caught, and
+# because a candidate is reported rather than replaced it can be far less careful than a detector —
+# the cost of a noisy candidate is one glance, the cost of a noisy rule is a useless report.
+SECRETISH = re.compile(r"(?i)(?:key|secret|token|pass|pwd|passwd|credential|auth|salt|signature|"
+                       r"private|cert|seed|mnemonic|otp|bearer|api)")
+NAMED_SITE = re.compile(r"(?i)(?P<key>[\w.\-]{2,64})\s*[:=]\s*[\"']?(?P<sec>[^\s\"',;}\]]{6,})")
+ANON_SITE = re.compile(r"(?P<keep>[\w.\-]+\s*[:=]\s*[\"']?)(?P<sec>[A-Za-z0-9+/_\-]{20,}={0,3})")
+DIGIT_RUN = re.compile(r"(?<![\w.])(?P<sec>\d{13,19})(?![\w.])")
+# PANs in the wild are spaced or dashed, and ISO timestamps are the thing most likely to be mistaken
+# for one, so the groupings are spelled out rather than left to `(?:\d[ -]?){12,22}`.
+CARD_RUN = re.compile(r"(?<![\d.\-])(?P<sec>\d{13,19}|\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,4}"
+                      r"|\d{4}[ -]\d{6}[ -]\d{5})(?![\d.\-])")
+DIGITS = set("0123456789")
+ALNUM = set(string.ascii_letters + string.digits)
+B64 = ALNUM | set("+/=_-")
+
+
+def classify(tok):
+    s = set(tok)
+    if s <= DIGITS:
+        return "digits"
+    if s <= DIGITS | set("abcdefABCDEFxX"):
+        return "hex"
+    if s <= ALNUM:
+        return "alnum"
+    if s <= B64:
+        return "base64ish"
+    return "mixed"
+
+
+def mask(tok):
+    """A candidate is described, never quoted. Four leading characters are enough to recognise a
+    vendor prefix; the length and the character set carry the rest of what a rule needs."""
+    if len(tok) < 12:
+        return "%d chars" % len(tok)
+    return "%s… %d chars" % (tok[:4], len(tok))
+
+
+def suggest_rule(name, tok):
+    """A starting point an agent can accept or edit, in the shape --rules takes."""
+    site = re.escape(name) if name else r"[\w.\-]+"
+    return {"name": (name or "unnamed").upper().replace("-", "_").replace(".", "_"),
+            "regex": r"(?i)(?P<keep>\b%s\s*[:=]\s*)(?P<sec>[^\s\"',;}\]]{%d,})"
+                     % (site, min(len(tok), 8)),
+            "screen": [name.lower()] if name else []}
 
 
 def near(text, lo, hi, window=CTX_WINDOW):
@@ -142,21 +210,42 @@ def entropy(tok):
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
+def luhn(digits):
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d = d * 2 - 9 if d > 4 else d * 2
+        total += d
+    return total % 10 == 0
+
+
 class Blotter:
     """One Blotter per run: the label table lives here, which is what makes redaction consistent."""
 
-    def __init__(self, stable=False, keep=(), pii=False, paranoid=False, screen=True):
+    def __init__(self, stable=False, keep=(), pii=False, paranoid=False, screen=True, rules=None,
+                 candidates=False):
         self.stable = stable
         self.keep = {k.upper() for k in keep}
         self.pii = pii
         self.paranoid = paranoid
+        self.candidates = candidates
         # screen=False runs every regex on every line whether or not it can match. It exists so the
         # suite can prove the screens cost nothing in correctness, not just in seconds.
         self.screen = screen
+        # Rules loaded from --rules go first: a pattern someone wrote for their own stack beats a
+        # generic guess, and the label it produces is the one they will read in the report.
+        self.rules = list(rules or []) + RULES
         self.labels = {}
         self.counts = {}
+        self.cands = {}
+        self.findings = []
+        self.findings_capped = False
         self.lines = 0
         self._n = {}
+        self._lineno = 0
+        self._hit_lines = {}
+        self._line_secrets = {}
         self._in_pem = False
         self._pem_lines = 0
 
@@ -191,15 +280,31 @@ class Blotter:
             if typ == "URLCREDS":
                 scheme, rest = sec.split("://", 1)
                 creds, _, host = rest.rpartition("@")
-                return "%s%s://<URLCREDENTIALS>@%s" % (keep, scheme, host)
-            return "%s%s%s%s" % (keep, q, self.label(typ, sec), q)
+                # Through the label table like every other secret. It used to return a fixed
+                # "<URLCREDENTIALS>" string, which meant the run's count under-reported and --map
+                # silently omitted the credential, so the file sold as the complete inverse of the
+                # redaction was missing a row.
+                lab = self.label("URLCREDENTIALS", sec)
+                self._note(typ, lab)
+                return "%s%s://%s@%s" % (keep, scheme, lab, host)
+            lab = self.label(typ, sec)
+            self._note(typ, lab)
+            return "%s%s%s%s" % (keep, q, lab, q)
 
         new = rx.sub(sub, text)
         return new, hits[0]
 
+    def _note(self, typ, lab):
+        """Where a secret was, for --json: the label and the line, never the value."""
+        if len(self.findings) < MAX_FINDINGS:
+            self.findings.append({"line": self._lineno, "type": typ, "label": lab})
+        else:
+            self.findings_capped = True
+
     def blot_line(self, line):
         """Returns (blotted_line, hit_count). Interior PEM lines collapse to nothing: a key block is
         one secret, not thirty, and a report should say so once."""
+        self._lineno += 1
         if self._in_pem:
             self._pem_lines += 1
             if PEM_END.search(line):
@@ -222,7 +327,7 @@ class Blotter:
                 out = out[:sm.start()] + self.label("SEEDPHRASE", sm.group(0)) + out[sm.end():]
                 hits += 1
         low = out.lower()
-        for typ, rx, screen in RULES:
+        for typ, rx, screen in self.rules:
             if typ in self.keep:
                 continue
             if self.screen and screen and not any(s in low for s in screen):
@@ -246,7 +351,57 @@ class Blotter:
             hits += n
         if hits:
             self.lines += 1
+        if self.candidates:
+            self._sweep(out)
         return out, hits
+
+    def _sweep(self, out):
+        """Note what survived, aggregated by shape so a 200k-line log reports one row per distinct
+        looking secret rather than one per line."""
+        for m in NAMED_SITE.finditer(out):
+            key, tok = m.group("key"), m.group("sec")
+            # No entropy floor here: a name that says KEY is the signal, and `password=
+            # correcthorsebattery` is a real secret with a low entropy score. A noisy candidate costs
+            # one glance; a missed one costs the leak.
+            if SECRETISH.search(key) and not LABEL_INNER.search(tok):
+                self._cand("named", key, tok, out)
+        for m in ANON_SITE.finditer(out):
+            tok = m.group("sec")
+            if not LABEL_INNER.search(tok) and entropy(tok) >= 3.5:
+                self._cand("entropy", m.group("keep").rstrip("=:\"' "), tok, out)
+        for m in DIGIT_RUN.finditer(out):
+            self._cand("digits", "", m.group("sec"), out)
+        for m in CARD_RUN.finditer(out):
+            raw = m.group("sec")
+            digits = re.sub(r"\D", "", raw)
+            # `raw` is what gets masked in the context: the digits are normalised for the Luhn check,
+            # and a context that replaces "4111111111111111" finds nothing in "4111 1111 1111 1111"
+            # and leaks the PAN it is reporting on.
+            if len(digits) in (13, 14, 15, 16, 19) and luhn(digits):
+                self._cand("card", "", digits, out, raw)
+
+    def _cand(self, kind, site, tok, line, hide=None):
+        key = (kind, site.lower(), classify(tok), len(tok))
+        self._line_secrets.setdefault(self._lineno, set()).add(hide or tok)
+        self._hit_lines[self._lineno] = line
+        if key in self.cands:
+            self.cands[key]["count"] += 1
+            return
+        self.cands[key] = {"kind": kind, "site": site or None, "charset": classify(tok),
+                           "length": len(tok), "entropy": round(entropy(tok), 2),
+                           "shape": mask(tok), "line": self._lineno, "count": 1,
+                           "suggested_rule": suggest_rule(site, tok) if kind == "named" else None}
+
+    def candidate_report(self):
+        """Candidates with their context, every secret-shaped span on that line masked out — the
+        context is where a report would otherwise leak exactly what it is reporting on."""
+        rows = sorted(self.cands.values(), key=lambda c: (-c["count"], c["kind"], c["line"]))
+        for row in rows:
+            line = self._hit_lines[row["line"]]
+            for tok in sorted(self._line_secrets[row["line"]], key=len, reverse=True):
+                line = line.replace(tok, mask(tok))
+            row["context"] = line.strip()[:160]
+        return rows
 
     def _entropy_pass(self, out):
         n = 0
@@ -262,7 +417,7 @@ class Blotter:
             if bare_hex and BENIGN_CONTEXT.search(near(out, m.start("sec"), m.end("sec"))):
                 pos = m.end("sec")
                 continue
-            if entropy(sec) >= PARANOID_MIN_BITS and not re.search(r"<[A-Z]+:", sec):
+            if entropy(sec) >= PARANOID_MIN_BITS and not LABEL_INNER.search(sec):
                 out = out[:m.start("sec")] + self.label("ENTROPY", sec) + out[m.end("sec"):]
                 n += 1
                 pos = m.start("sec")
@@ -272,6 +427,48 @@ class Blotter:
     def stream_lines(self, lines):
         for raw in lines:
             yield self.blot_line(raw.rstrip("\n"))[0]
+
+
+def load_rules(path):
+    """Read a --rules file: a list of {"name","regex","screen"}, or an object with a "rules" list.
+    Returns (rules, error). A malformed rule is an error rather than a skip: a detector that failed
+    to load quietly is a secret kept quietly."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except OSError as exc:
+        return None, "%s: %s" % (path, getattr(exc, "strerror", None) or exc)
+    except ValueError as exc:
+        return None, "%s: not valid JSON (%s)" % (path, exc)
+    items = doc.get("rules") if isinstance(doc, dict) else doc
+    if not isinstance(items, list):
+        return None, "%s: expected a list, or an object with a 'rules' list" % path
+    rules = []
+    for i, r in enumerate(items):
+        if not isinstance(r, dict) or not r.get("name") or not r.get("regex"):
+            return None, "%s: rule %d needs a name and a regex" % (path, i)
+        name = str(r["name"]).upper()
+        try:
+            rx = re.compile(r["regex"])
+        except re.error as exc:
+            return None, "%s: rule %s: %s" % (path, name, exc)
+        if "sec" not in rx.groupindex:
+            return None, "%s: rule %s has no (?P<sec>...) group, so nothing would be replaced" \
+                         % (path, name)
+        rules.append((name, rx, tuple(str(s).lower() for s in r.get("screen") or ())))
+    return rules, None
+
+
+def dump_rules(path):
+    """Write the built-in set out so someone (or some agent) can edit a copy of it rather than
+    invent one. Screens are included because they are the part that is easiest to get wrong."""
+    doc = {"rules": [{"name": t, "regex": rx.pattern, "screen": list(s)} for t, rx, s in RULES]}
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=1)
+    except OSError as exc:
+        return "%s: %s" % (path, getattr(exc, "strerror", None) or exc)
+    return None
 
 
 def read_input(files):
@@ -335,6 +532,16 @@ def main(argv=None):
     ap.add_argument("--paranoid", action="store_true",
                     help="also blot high-entropy values sitting at a key, quote or --flag= site")
     ap.add_argument("--quiet", action="store_true", help="suppress the stderr report")
+    ap.add_argument("--rules", metavar="FILE",
+                    help="extra detectors from a JSON file ({name, regex, screen}), applied before "
+                         "the built-ins")
+    ap.add_argument("--dump-rules", metavar="FILE",
+                    help="write the built-in rule set here to edit, then feed it back with --rules")
+    ap.add_argument("--candidates", action="store_true",
+                    help="report what survived, described rather than quoted, for a reviewer or an "
+                         "agent to adjudicate")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable findings on stdout; the redacted text then needs --out")
     ap.add_argument("--list-types", action="store_true")
     ap.add_argument("--version", action="store_true")
     a = ap.parse_args(argv)
@@ -342,8 +549,24 @@ def main(argv=None):
     if a.version:
         print("%s %s" % (PROG, VERSION))
         return 0
+
+    custom = None
+    if a.rules:
+        custom, err = load_rules(a.rules)
+        if err:
+            sys.stderr.write("%s: %s\n" % (PROG, err))
+            return 2
+
+    if a.dump_rules:
+        err = dump_rules(a.dump_rules)
+        if err:
+            sys.stderr.write("%s: %s\n" % (PROG, err))
+            return 2
+        sys.stderr.write("%s: %d built-in rules -> %s\n" % (PROG, len(RULES), a.dump_rules))
+        return 0
+
     if a.list_types:
-        types = [t for t, _, _ in RULES] + ["PRIVKEY", "SEEDPHRASE"]
+        types = [t for t, _, _ in (custom or []) + RULES] + ["PRIVKEY", "SEEDPHRASE"]
         if a.pii:
             types += [t for t, _, _ in PII]
         if a.paranoid:
@@ -351,7 +574,8 @@ def main(argv=None):
         print("\n".join(sorted(set(types))))
         return 0
 
-    unknown = [k for k in a.keep if k.upper() not in ALL_TYPES]
+    known = ALL_TYPES | {t for t, _, _ in (custom or [])}
+    unknown = [k for k in a.keep if k.upper() not in known]
     if unknown:
         # A typo in --keep would otherwise be silently ignored, and the type the user meant to
         # spare gets blotted anyway — or worse, they believe something was spared that was not.
@@ -364,7 +588,8 @@ def main(argv=None):
                          "--help\n" % PROG)
         return 2
 
-    b = Blotter(stable=a.stable, keep=[k.upper() for k in a.keep], pii=a.pii, paranoid=a.paranoid)
+    b = Blotter(stable=a.stable, keep=[k.upper() for k in a.keep], pii=a.pii,
+                paranoid=a.paranoid, rules=custom, candidates=a.candidates or a.json)
     src, err = read_input(a.files)
     if err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
@@ -373,10 +598,11 @@ def main(argv=None):
     out_lines = list(b.stream_lines(src))
     text = "\n".join(out_lines)
     payload = (text if text.endswith("\n") or not text else text + "\n")
-    err = emit(payload, a.out)
-    if err:
-        sys.stderr.write("%s: %s\n" % (PROG, err))
-        return 2
+    if a.out or not a.json:
+        err = emit(payload, a.out)
+        if err:
+            sys.stderr.write("%s: %s\n" % (PROG, err))
+            return 2
 
     if not a.quiet:
         kinds = " ".join("%s=%d" % (k, v) for k, v in sorted(b.counts.items()))
@@ -386,6 +612,21 @@ def main(argv=None):
             % (PROG, total, len(b.labels), b.lines,
                "" if total else "  — nothing matched, which is NOT evidence the text was clean",
                "  " + kinds if kinds else "  (none)"))
+
+    rows = b.candidate_report() if (a.candidates or a.json) else []
+    if a.candidates and not a.json:
+        for c in rows[:40]:
+            sys.stderr.write("%s: %-7s %-20s %-9s %-16s x%-4d line %d\n"
+                             % (PROG, c["kind"], (c["site"] or "-")[:20], c["charset"],
+                                c["shape"], c["count"], c["line"]))
+            sys.stderr.write("%s:         %s\n" % (PROG, c["context"]))
+        if len(rows) > 40:
+            sys.stderr.write("%s: ... %d more distinct shapes (--json for all)\n"
+                             % (PROG, len(rows) - 40))
+        elif not rows:
+            sys.stderr.write("%s: no candidates — nothing that survived is secret-shaped, which is "
+                             "still not proof that nothing is\n" % PROG)
+
     if a.mapfile:
         # Created exclusive at 0600 instead of written then chmod'ed: in the window between those two
         # calls, every secret from this run sat in a file the rest of the machine could read. An
@@ -401,16 +642,27 @@ def main(argv=None):
         sys.stderr.write("%s: reverse map -> %s (0600). Publish that file and you have published "
                          "every secret in here.\n" % (PROG, a.mapfile))
 
+    live = []
     if a.verify:
         # verify deliberately ignores --keep: auditing a redaction against the same exceptions
-        # that produced it is how a leak gets certified clean.
-        check = Blotter(pii=a.pii, paranoid=a.paranoid)
-        live = []
+        # that produced it is how a leak gets certified clean. It does honour --rules, because a
+        # detector someone added on purpose is part of what "recognisable" now means.
+        check = Blotter(pii=a.pii, paranoid=a.paranoid, rules=custom)
         for i, line in enumerate(out_lines, 1):
-            if line and check.blot_line(line)[1] and not re.search(r"<[A-Z]+:", line):
+            if line and check.blot_line(line)[1] and not LABEL_INNER.search(line):
                 live.append(i)
-            elif line and re.search(r"<[A-Z]+:[^>]*>[^\s<]*[A-Za-z0-9_/+\-]{16,}", line):
+            elif line and LABEL_TAIL.search(line):
                 live.append(i)
+
+    if a.json:
+        print(json.dumps({"version": VERSION, "inputs": a.files or ["-"], "lines": b._lineno,
+                          "blotted": sum(b.counts.values()), "distinct": len(b.labels),
+                          "by_type": dict(sorted(b.counts.items())), "findings": b.findings,
+                          "findings_truncated": b.findings_capped, "candidates": rows,
+                          "verify": {"clean": not live, "lines": live[:200]} if a.verify else None},
+                         indent=1, sort_keys=True))
+
+    if a.verify:
         if live:
             sys.stderr.write("%s: NOT CLEAN — something recognisable is still live on line(s) %s\n"
                              % (PROG, ", ".join(map(str, live[:20]))))
