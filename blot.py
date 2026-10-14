@@ -118,13 +118,17 @@ RULES = [
         r"(?i)(?P<keep>\b(?:cookie|set-cookie)\s*[:=]\s*)(?P<sec>[^\r\n\"']{8,})"), ("cookie",)),
     # Curated on purpose, not `.*key.*=`: over-redacting a log is also a failure, and it is the one
     # that quietly destroys the report you were trying to publish. Long tail -> --paranoid.
+    # The boundaries on `pass` and the otp family are load-bearing: without them `bypass:`,
+    # `compass:` and `footprint:` all contain a secret name and get blotted anyway.
     ("KV", re.compile(
-        r"(?i)(?P<keep>[\"']?(?:password|passwd|pass|pwd|secret|secret[_-]?key(?:[_-]?base)?|"
+        r"(?i)(?P<keep>[\"']?(?:(?<![a-z])pass(?:word|phrase|ed|wd)?(?![a-z])|"
+        r"(?<![a-z])pwd(?![a-z])|secret|secret[_-]?key(?:[_-]?base)?|"
         r"api[_-]?key|apikey|app[_-]?key|master[_-]?key|encryption[_-]?key|signing[_-]?key|"
         r"access[_-]?key(?:[_-]?id)?|access[_-]?token|private[_-]?key|auth[_-]?token|"
         r"refresh[_-]?token|session[_-]?token|bearer[_-]?token|id[_-]?token|token|seed|mnemonic|"
-        r"recovery[_-]?phrase|otp|client[_-]?secret|webhook[_-]?secret)"
-        r"[\"']?\s*[:=]\s*)(?P<q>[\"']?)(?P<sec>[^\"'\s,;}\]]{5,})(?P<tail>(?P=q))"),
+        r"recovery[_-]?phrase|\b(?:totp|hotp|otp|mfa[_-]?code)\b|client[_-]?secret|"
+        r"webhook[_-]?secret)[\"']?\s*[:=]\s*)(?P<q>[\"']?)(?P<sec>[^\"'\s,;}\]]{5,})"
+        r"(?P<tail>(?P=q))"),
      ("pass", "pwd", "secret", "key", "token", "seed", "mnemonic", "recovery", "phrase", "otp")),
 ]
 
@@ -181,6 +185,12 @@ ALL_TYPES = {t for t, _, _ in RULES} | {t for t, _, _ in PII} | {"PRIVKEY", "SEE
 # the cost of a noisy candidate is one glance, the cost of a noisy rule is a useless report.
 SECRETISH = re.compile(r"(?i)(?:key|secret|token|pass|pwd|passwd|credential|auth|salt|signature|"
                        r"private|cert|seed|mnemonic|otp|bearer|api)")
+# The same words as plain substrings, for the per-line prefilter: the 16-branch regex cost 5.7s per
+# 12 MB where these cost 0.5s, and it runs on every line rather than on the few that carry a name.
+# Soundness needs only that every line SECRETISH can match is let through — "passwd" contains "pass",
+# so the shorter list is still a superset of what matters. The deciding test is inside _sweep.
+SECRET_WORDS = ("key", "secret", "token", "pass", "pwd", "credential", "auth", "salt", "signature",
+                "private", "cert", "seed", "mnemonic", "otp", "bearer", "api")
 NAMED_SITE = re.compile(r"(?i)(?P<key>[\w.\-]{2,64})\s*[:=]\s*[\"']?(?P<sec>[^\s\"',;}\]]{6,})")
 ANON_SITE = re.compile(r"(?P<keep>[\w.\-]+\s*[:=]\s*[\"']?)(?P<sec>[A-Za-z0-9+/_\-]{20,}={0,3})")
 DIGIT_RUN = re.compile(r"(?<![\w.])(?P<sec>\d{13,19})(?![\w.])")
@@ -188,6 +198,23 @@ DIGIT_RUN = re.compile(r"(?<![\w.])(?P<sec>\d{13,19})(?![\w.])")
 # for one, so the groupings are spelled out rather than left to `(?:\d[ -]?){12,22}`.
 CARD_RUN = re.compile(r"(?<![\d.\-])(?P<sec>\d{13,19}|\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,4}"
                       r"|\d{4}[ -]\d{6}[ -]\d{5})(?![\d.\-])")
+# The classes below are what the *unnamed* half of a leak looks like: a secret with no key name in
+# front of it. They are reported, never replaced, so they can be far less careful than a detector —
+# the cost of a noisy candidate is one glance, the cost of a noisy rule is a useless report.
+BARE_SECRET = re.compile(r"(?P<sec>\b[A-Za-z0-9+/_\-]{20,}={0,3}\b)")
+BARE_MIN_BITS = 4.0
+HEX_SECRET = re.compile(r"\b(?P<sec>(?:0x)?[0-9a-fA-F]{40}|(?:0x)?[0-9a-fA-F]{64})\b")
+UUID_SECRET = re.compile(r"\b(?P<sec>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b")
+# A TOTP seed is 16-32 characters of base32 and appears in provisioning dumps with no name at all.
+BASE32_SECRET = re.compile(r"\b(?P<sec>[A-Z2-7]{16,32}={0,1})\b")
+# Union of what the classes that carry no key name need: a long token, a long digit run, a spaced
+# PAN, a UUID prefix, a base32 seed. Together with SECRETISH (which is what the named class needs)
+# it is a necessary condition for any candidate at all, so a line with none of them skips eight
+# regexes. The spaced and dashed shapes are spelled out because `\\d{13,}` and `[A-Za-z0-9+/_-]{20,}`
+# do not match them — leaving those out would hide card numbers and UUIDs, not just skip work.
+CAND_ANY = re.compile(r"[A-Za-z0-9+/_\-]{20,}|\d{13,}|[A-Z2-7]{16,}"
+                      r"|\d{4}[ -]\d{4}[ -]\d{4}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-")
 DIGITS = set("0123456789")
 ALNUM = set(string.ascii_letters + string.digits)
 B64 = ALNUM | set("+/=_-")
@@ -395,34 +422,53 @@ class Blotter:
             hits += n
         if hits:
             self.lines += 1
-        if self.candidates:
+        # out.lower() rather than the loop's `low`: --paranoid rewrites the line after it, and a
+        # prefilter should read the text the sweep is about to read.
+        if self.candidates and (not self.screen or CAND_ANY.search(out)
+                                or any(w in out.lower() for w in SECRET_WORDS)):
             self._sweep(out)
         return out, hits
 
     def _sweep(self, out):
         """Note what survived, aggregated by shape so a 200k-line log reports one row per distinct
-        looking secret rather than one per line."""
+        looking secret rather than one per line. The specific classes run first and mark the spans
+        they took, so a PAN is not also reported as a bare digit run."""
+        taken = []
+
+        def note(kind, site, tok, span=None):
+            if LABEL_INNER.search(tok):
+                return
+            if span and any(t[0] <= span[0] and span[1] <= t[1] for t in taken):
+                return
+            if span:
+                taken.append(span)
+            self._cand(kind, site, tok, out, span and out[span[0]:span[1]])
+
         for m in NAMED_SITE.finditer(out):
             key, tok = m.group("key"), m.group("sec")
             # No entropy floor here: a name that says KEY is the signal, and `password=
             # correcthorsebattery` is a real secret with a low entropy score. A noisy candidate costs
             # one glance; a missed one costs the leak.
-            if SECRETISH.search(key) and not LABEL_INNER.search(tok):
-                self._cand("named", key, tok, out)
+            if SECRETISH.search(key):
+                note("named", key, tok)
         for m in ANON_SITE.finditer(out):
             tok = m.group("sec")
-            if not LABEL_INNER.search(tok) and entropy(tok) >= 3.5:
-                self._cand("entropy", m.group("keep").rstrip("=:\"' "), tok, out)
+            if entropy(tok) >= 3.5:
+                note("entropy", m.group("keep").rstrip("=:\"' "), tok, (m.start("sec"), m.end("sec")))
+        for rx, kind in ((CARD_RUN, "card"), (UUID_SECRET, "uuid"), (HEX_SECRET, "hex"),
+                         (BASE32_SECRET, "base32")):
+            for m in rx.finditer(out):
+                if kind == "card":
+                    digits = re.sub(r"\D", "", m.group("sec"))
+                    if len(digits) in (13, 14, 15, 16, 19) and luhn(digits):
+                        note(kind, "", digits, (m.start("sec"), m.end("sec")))
+                else:
+                    note(kind, "", m.group("sec"), (m.start("sec"), m.end("sec")))
         for m in DIGIT_RUN.finditer(out):
-            self._cand("digits", "", m.group("sec"), out)
-        for m in CARD_RUN.finditer(out):
-            raw = m.group("sec")
-            digits = re.sub(r"\D", "", raw)
-            # `raw` is what gets masked in the context: the digits are normalised for the Luhn check,
-            # and a context that replaces "4111111111111111" finds nothing in "4111 1111 1111 1111"
-            # and leaks the PAN it is reporting on.
-            if len(digits) in (13, 14, 15, 16, 19) and luhn(digits):
-                self._cand("card", "", digits, out, raw)
+            note("digits", "", m.group("sec"), (m.start("sec"), m.end("sec")))
+        for m in BARE_SECRET.finditer(out):
+            if entropy(m.group("sec")) >= BARE_MIN_BITS:
+                note("bare", "", m.group("sec"), (m.start("sec"), m.end("sec")))
 
     def _cand(self, kind, site, tok, line, hide=None):
         key = (kind, site.lower(), classify(tok), len(tok))

@@ -478,6 +478,77 @@ class TestMapGuard(unittest.TestCase):
             os.remove(path)
 
 
+    def test_a_word_that_merely_contains_a_secret_name_is_not_one(self):
+        # `pass` and `otp` are substrings of ordinary words; without boundaries bypass, compass and
+        # footprint all look like fields holding a credential and get blotted.
+        for line in ["bypass=123456789", "compass: 123456789", "footprint=1234567890",
+                     "surpass: 123456789", "tokenizer=created_at"]:
+            out, _ = blot.Blotter().blot_line(line)
+            self.assertEqual(out, line, "over-redacted: " + out)
+
+    def test_the_compound_and_uppercase_forms_still_blot(self):
+        for line in ["password=abcdefgh12345", "passwd: abcdefgh12345", "pass=abcdefgh12345",
+                     "passphrase=abcdefgh12345", "totp=JBSWY3DPEHPK3PXP", "OTP: JBSWY3DPEHPK3PXP"]:
+            out, hits = blot.Blotter().blot_line(line)
+            self.assertTrue(hits, "missed: " + line)
+            self.assertNotIn("abcdefgh12345", out)
+            self.assertNotIn("JBSWY3DPEHPK3PXP", out)
+
+
+class TestCandidateClasses(unittest.TestCase):
+    """The half of a leak that wears no key name — a bare seed, a UUID, a hex private key, a base64
+    blob — is invisible to the rules by design. The sweep is what makes it visible to a reviewer."""
+
+    def test_the_sweep_reports_secrets_that_wore_no_key_name(self):
+        for line, kind in [
+            ("trace 6fa45ea5-4cf0-4c4b-9f42-c0e0f0e0d1c2 accepted", "uuid"),
+            ("session 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8 ok", "hex"),
+            ("provision JBSWY3DPEHPK3PXPAAB for user 42", "base32"),
+            ("blob dGhpcyBpc250YSBzZWNyZXQgYnV0IG5vbmUgaGFzIG1lCg dumped", "bare"),
+        ]:
+            b = blot.Blotter(candidates=True)
+            b.blot_line(line)
+            kinds = {c["kind"] for c in b.candidate_report()}
+            self.assertIn(kind, kinds, "%s not reported as %s: %s" % (line, kind, sorted(kinds)))
+
+    def test_a_shape_is_reported_once_under_its_most_specific_class(self):
+        line = "session 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8 ok"
+        b = blot.Blotter(candidates=True)
+        b.blot_line(line)
+        rows = b.candidate_report()
+        self.assertEqual([r["kind"] for r in rows], ["hex"], rows)
+
+    def test_a_card_is_not_also_reported_as_a_bare_digit_run(self):
+        b = blot.Blotter(candidates=True)
+        b.blot_line("acct=4111 1111 1111 1111")
+        self.assertEqual([r["kind"] for r in b.candidate_report()], ["card"])
+
+    def test_the_sweep_still_quotes_nothing(self):
+        b = blot.Blotter(candidates=True)
+        for line in ["provision JBSWY3DPEHPK3PXPAAB", "trace 6fa45ea5-4cf0-4c4b-9f42-c0e0f0e0d1c2",
+                     "session 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8"]:
+            b.blot_line(line)
+        blob = json.dumps(b.candidate_report())
+        for secret in ("JBSWY3DPEHPK3PXPAAB", "6fa45ea5-4cf0-4c4b-9f42-c0e0f0e0d1c2",
+                       "4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8"):
+            self.assertNotIn(secret, blob, "a candidate context leaked the value it describes")
+
+    def test_the_candidate_prefilter_changes_nothing(self):
+        lines = TestScreens.corpus() + [
+            "acct=4111 1111 1111 1111", "trace 6fa45ea5-4cf0-4c4b-9f42-c0e0f0e0d1c2",
+            "provision JBSWY3DPEHPK3PXPAAB",
+            "blob dGhpcyBpc250YSBzZWNyZXQgYnV0IG5vbmUgaGFzIG1lCg",
+            "session 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8", "MY_INTERNAL_KEY=zzzQQQQqqqzz",
+            "just a sentence about nothing", "GET /api/v1/users?page=2 200 14ms",
+        ]
+        for line in lines:
+            on = blot.Blotter(candidates=True)
+            off = blot.Blotter(candidates=True, screen=False)
+            self.assertEqual(on.blot_line(line), off.blot_line(line), line)
+            self.assertEqual(on.candidate_report(), off.candidate_report(),
+                             "the prefilter hid a candidate on: %s" % line)
+
+
 class TestEntropyGate(unittest.TestCase):
     SHA = "4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8"
     OTHER = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
