@@ -473,6 +473,21 @@ class TestAgentSurface(unittest.TestCase):
         self.assertEqual(doc["findings"], [{"line": 1, "type": "STRIPE", "label": "<STRIPE:1>"}])
         self.assertNotIn("sk_live", json.dumps(doc))
 
+    def test_every_blot_path_is_locatable_not_merely_counted(self):
+        """PEM, seed runs and entropy strays reach label() directly rather than through a rule, so
+        they were counted by type and absent from findings — a report that says how many and not
+        where. by_type totals and findings length must agree."""
+        text = (PEM + "\nwallet: " + SEED + "\ncipher=" + "0a1b2c3d4e5f60718293a4b5c6d7e8f90123a4b5"
+                + "\n" + AWS + "\n")
+        rc, out, err = run("--json", "--paranoid", "--out", os.devnull, stdin=text)
+        self.assertEqual(rc, 0, err)
+        doc = json.loads(out)
+        found = {f["type"] for f in doc["findings"]}
+        for typ in ("PRIVKEY", "SEEDPHRASE", "ENTROPY", "AWS"):
+            self.assertIn(typ, found, "%s counted but never located: %s" % (typ, sorted(found)))
+        self.assertEqual(sum(doc["by_type"].values()), len(doc["findings"]),
+                         "%s vs %s" % (doc["by_type"], len(doc["findings"])))
+
     def test_dump_rules_round_trips_back_through_rules(self):
         path = os.path.join(HERE, "_dump.json")
         rc, _o, err = run("--dump-rules", path)

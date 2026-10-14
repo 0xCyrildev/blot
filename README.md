@@ -85,7 +85,7 @@ produced it is how a leak gets certified clean.
 ## Develop
 
 ```sh
-python3 tests/test_blot.py    # 45 tests, stdlib only, no install step
+python3 tests/test_blot.py    # 46 tests, stdlib only, no install step
 ```
 
 MIT. If blot cost you a credential, the failure was the credential being there — but do open an

@@ -279,7 +279,7 @@ class Blotter:
             sec = m.group("sec")
             if typ == "URLCREDS":
                 scheme, rest = sec.split("://", 1)
-                creds, _, host = rest.rpartition("@")
+                host = rest.rpartition("@")[2]
                 # Through the label table like every other secret. It used to return a fixed
                 # "<URLCREDENTIALS>" string, which meant the run's count under-reported and --map
                 # silently omitted the credential, so the file sold as the complete inverse of the
@@ -314,9 +314,11 @@ class Blotter:
         if m:
             self._in_pem = True
             self._pem_lines = 1
+            lab = self.label("PRIVKEY", "<pem-block>")
+            self._note("PRIVKEY", lab)
             if not PEM_END.search(line):
-                return self.label("PRIVKEY", "<pem-block>"), 1
-            return self.label("PRIVKEY", "<pem-block>") + line[m.end():], 1
+                return lab, 1
+            return lab + line[m.end():], 1
 
         out = line
         hits = 0
@@ -324,7 +326,9 @@ class Blotter:
         if sm:
             words = sm.group(0).split()
             if len(words) in SEED_COUNTS and len(SEED_HINT & set(words)) >= 2:
-                out = out[:sm.start()] + self.label("SEEDPHRASE", sm.group(0)) + out[sm.end():]
+                lab = self.label("SEEDPHRASE", sm.group(0))
+                self._note("SEEDPHRASE", lab)
+                out = out[:sm.start()] + lab + out[sm.end():]
                 hits += 1
         low = out.lower()
         for typ, rx, screen in self.rules:
@@ -418,7 +422,9 @@ class Blotter:
                 pos = m.end("sec")
                 continue
             if entropy(sec) >= PARANOID_MIN_BITS and not LABEL_INNER.search(sec):
-                out = out[:m.start("sec")] + self.label("ENTROPY", sec) + out[m.end("sec"):]
+                lab = self.label("ENTROPY", sec)
+                self._note("ENTROPY", lab)
+                out = out[:m.start("sec")] + lab + out[m.end("sec"):]
                 n += 1
                 pos = m.start("sec")
             else:
