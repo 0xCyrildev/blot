@@ -542,8 +542,9 @@ def main(argv=None):
                          "agent to adjudicate")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable findings on stdout; the redacted text then needs --out")
-    ap.add_argument("--list-types", action="store_true")
-    ap.add_argument("--version", action="store_true")
+    ap.add_argument("--list-types", action="store_true",
+                    help="print every type blot can blot, honouring --pii/--paranoid/--rules")
+    ap.add_argument("--version", action="store_true", help="print the version and exit")
     a = ap.parse_args(argv)
 
     if a.version:
