@@ -162,6 +162,33 @@ class TestVerify(unittest.TestCase):
         self.assertLess(time.time() - t, 3.0, "one 240 KB log line took too long")
 
 
+class TestKeyNames(unittest.TestCase):
+    """KV is a curated list of names, so the list has to cover the names people actually leak.
+    Over-matching is a failure too, so both directions get asserted."""
+
+    def test_framework_secret_names_are_caught_by_name(self):
+        for line in ["APP_KEY=base64:VGhpcyBpc250YV9yZWFsX2tleQ==",
+                     "SECRET_KEY_BASE=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+                     "MASTER_KEY=0123456789abcdef0123456789abcdef",
+                     "encryption_key = f9e8d7c6b5a4938271625f4e3d2c1b0a"]:
+            out, hits = blot.Blotter().blot_line(line)
+            self.assertTrue(hits, "missed by name: " + line)
+            self.assertNotIn(line.split("=", 1)[1].strip(), out, "survived: " + out)
+
+    def test_an_ordinary_key_name_is_not_treated_as_a_secret(self):
+        for line in ["sort_key=created_at", "cache_key=user:42", "monkey_key=banana",
+                     "primary_key=id"]:
+            out, _ = blot.Blotter().blot_line(line)
+            self.assertEqual(out, line, "over-redacted: " + line)
+
+    def test_paranoid_reaches_the_vendor_names_the_list_cannot_hold(self):
+        line = "MYVENDOR_KEY=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+        self.assertEqual(blot.Blotter().blot_line(line)[0], line, "the default stays quiet")
+        out, hits = blot.Blotter(paranoid=True).blot_line(line)
+        self.assertTrue(hits, "--paranoid should reach the long tail of *key= sites")
+        self.assertIn("<ENTROPY", out)
+
+
 class TestInputAndErrors(unittest.TestCase):
     """The failure modes that make a redactor unsafe to trust: silently doing nothing."""
 
@@ -265,8 +292,9 @@ class TestEntropyGate(unittest.TestCase):
 
     def test_a_hex_key_is_blotted_once_the_measure_is_in_bits(self):
         # ln(16)=2.77 nats: under a nats threshold no hex secret could ever reach 3.0, so --paranoid
-        # silently spared every 40-hex key.
-        out, hits = blot.Blotter(paranoid=True).blot_line("encryption_key=" + self.OTHER)
+        # silently spared every 40-hex key. Name a site KV does not know, so this proves the measure
+        # and not the keyword list.
+        out, hits = blot.Blotter(paranoid=True).blot_line("cipher=" + self.OTHER)
         self.assertTrue(hits, "a 40-hex value at a key site was spared")
         self.assertIn("<ENTROPY", out)
 

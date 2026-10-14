@@ -42,11 +42,15 @@ RULES = [
         r"(?P<sec>bearer\s+[A-Za-z0-9._~+/=-]{12,})")),
     ("BASIC", re.compile(r"(?i)(?P<keep>\bbasic\s+)(?P<sec>[A-Za-z0-9+/]{12,}={0,2})")),
     ("COOKIE", re.compile(r"(?i)(?P<keep>\b(?:cookie|set-cookie)\s*[:=]\s*)(?P<sec>[^\r\n\"']{8,})")),
+    # Curated on purpose, not `.*key.*=`: over-redacting a log is also a failure, and it is the one
+    # that quietly destroys the report you were trying to publish. Long tail -> --paranoid.
     ("KV", re.compile(
-        r"(?i)(?P<keep>[\"']?(?:password|passwd|pass|pwd|secret|secret[_-]?key|api[_-]?key|apikey|"
-        r"access[_-]?key(?:[_-]?id)?|private[_-]?key|auth[_-]?token|refresh[_-]?token|"
-        r"session[_-]?token|token|seed|mnemonic|recovery[_-]?phrase|otp|client[_-]?secret|"
-        r"webhook[_-]?secret)[\"']?\s*[:=]\s*)(?P<q>[\"']?)(?P<sec>[^\"'\s,;}\]]{5,})(?P<tail>(?P=q))")),
+        r"(?i)(?P<keep>[\"']?(?:password|passwd|pass|pwd|secret|secret[_-]?key(?:[_-]?base)?|"
+        r"api[_-]?key|apikey|app[_-]?key|master[_-]?key|encryption[_-]?key|signing[_-]?key|"
+        r"access[_-]?key(?:[_-]?id)?|access[_-]?token|private[_-]?key|auth[_-]?token|"
+        r"refresh[_-]?token|session[_-]?token|bearer[_-]?token|id[_-]?token|token|seed|mnemonic|"
+        r"recovery[_-]?phrase|otp|client[_-]?secret|webhook[_-]?secret)"
+        r"[\"']?\s*[:=]\s*)(?P<q>[\"']?)(?P<sec>[^\"'\s,;}\]]{5,})(?P<tail>(?P=q))")),
 ]
 
 PII = (("EMAIL", re.compile(r"\b[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+\b")),
