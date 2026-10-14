@@ -226,6 +226,13 @@ def near(text, lo, hi, window=CTX_WINDOW):
     return text[max(0, lo - window):hi + window]
 
 
+# Every rule has at least one screen literal, so "none of them are on this line" is a necessary
+# condition for "no rule can match this line". Testing that as one alternation costs one C pass
+# instead of ~70 Python-level substring checks per line, which is what the per-rule screens add up
+# to on a 200k-line log.
+SCREEN_ANY = re.compile("|".join(re.escape(s) for _t, _rx, sc in RULES for s in sc))
+
+
 def entropy(tok):
     """Bits per character. The threshold below is written in bits, so this must be log2: measured in
     nats, the ceiling for a hex string is ln(16)=2.77, and no 40-hex key could ever reach 3.0."""
@@ -264,6 +271,9 @@ class Blotter:
         # Rules loaded from --rules go first: a pattern someone wrote for their own stack beats a
         # generic guess, and the label it produces is the one they will read in the report.
         self.rules = list(rules or []) + RULES
+        # A custom rule may arrive with no screen, and then the union-of-screens shortcut is not
+        # sound for it, so the shortcut is only built when every active rule screens for something.
+        self._prefilter = SCREEN_ANY if all(sc for _t, _rx, sc in self.rules) else None
         self.labels = {}
         self.counts = {}
         self.cands = {}
@@ -359,15 +369,16 @@ class Blotter:
                 out = out[:sm.start()] + lab + out[sm.end():]
                 hits += 1
         low = out.lower()
-        for typ, rx, screen in self.rules:
-            if typ in self.keep:
-                continue
-            if self.screen and screen and not any(s in low for s in screen):
-                continue
-            new, n = self._apply(out, typ, rx)
-            if n:
-                out, hits = new, hits + n
-                low = out.lower()
+        if not self.screen or self._prefilter is None or self._prefilter.search(low):
+            for typ, rx, screen in self.rules:
+                if typ in self.keep:
+                    continue
+                if self.screen and screen and not any(s in low for s in screen):
+                    continue
+                new, n = self._apply(out, typ, rx)
+                if n:
+                    out, hits = new, hits + n
+                    low = out.lower()
         if self.pii:
             for typ, rx, screen in PII:
                 if typ in self.keep:
