@@ -72,19 +72,34 @@ SEED_COUNTS = (12, 15, 18, 21, 24)
 ENTROPY_SITE = re.compile(
     r"(?P<keep>(?:[\w.\-]+\s*[:=]\s*[\"']?|--[\w.\-]+=|[\"']))(?P<sec>[A-Za-z0-9+/_\-]{24,}={0,3})")
 BENIGN_CONTEXT = re.compile(r"(?i)\b(?:commit|tree|parent|blob|sha1|sha256|checksum|integrity|"
-                            r"merkle|blockhash|digest|etag)\b")
+                            r"merkle|blockhash|digest|etag|detached|head)\b")
 HEX = set("0123456789abcdefABCDEF")
+# How much text either side of a bare hex string counts as "context for it". Whole-line context made
+# every 40-hex secret on a line that merely said `blob` immune, so the decision is local.
+CTX_WINDOW = 48
+# A value at a key/quote/--flag= site is blotted by the last-resort rule above this many bits per
+# character. 3.0 spare bits is roughly "not English, not a version number, not a git sha".
+PARANOID_MIN_BITS = 3.0
 LABEL_INNER = re.compile(r"<[A-Z]+:[^>]*>?", re.I)
 
 
+ALL_TYPES = {t for t, _ in RULES} | {t for t, _ in PII} | {"PRIVKEY", "SEEDPHRASE", "ENTROPY"}
+
+
+def near(text, lo, hi, window=CTX_WINDOW):
+    return text[max(0, lo - window):hi + window]
+
+
 def entropy(tok):
+    """Bits per character. The threshold below is written in bits, so this must be log2: measured in
+    nats, the ceiling for a hex string is ln(16)=2.77, and no 40-hex key could ever reach 3.0."""
     if not tok:
         return 0.0
     counts = {}
     for c in tok:
         counts[c] = counts.get(c, 0) + 1
     n = float(len(tok))
-    return -sum((c / n) * math.log(c / n) for c in counts.values())
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
 class Blotter:
@@ -192,12 +207,12 @@ class Blotter:
                 return out, n
             sec = m.group("sec")
             bare_hex = len(sec) in (40, 64) and set(sec) <= HEX
-            # A 40-hex after the word `commit` is a git sha: eating it destroys the thing the log is
-            # for, so context decides, not the character set.
-            if bare_hex and BENIGN_CONTEXT.search(out):
+            # A 40-hex next to the word `commit` is a git sha: eating it destroys the thing the log is
+            # for, so context decides, not the character set. Context means *beside* it, not anywhere.
+            if bare_hex and BENIGN_CONTEXT.search(near(out, m.start("sec"), m.end("sec"))):
                 pos = m.end("sec")
                 continue
-            if entropy(sec) >= 3.0 and not re.search(r"<[A-Z]+:", sec):
+            if entropy(sec) >= PARANOID_MIN_BITS and not re.search(r"<[A-Z]+:", sec):
                 out = out[:m.start("sec")] + self.label("ENTROPY", sec) + out[m.end("sec"):]
                 n += 1
                 pos = m.start("sec")
@@ -207,6 +222,45 @@ class Blotter:
     def stream_lines(self, lines):
         for raw in lines:
             yield self.blot_line(raw.rstrip("\n"))[0]
+
+
+def read_input(files):
+    """Lines from the named files, or from stdin when none are given; `-` always means stdin.
+    Returns (lines, error) — a missing file is a message, not a traceback."""
+    lines = []
+    for name in files or ["-"]:
+        try:
+            if name == "-":
+                text = sys.stdin.read()
+            else:
+                with open(name, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+        except OSError as exc:
+            return None, "%s: %s" % (name, getattr(exc, "strerror", None) or exc)
+        lines.extend(text.split("\n"))
+    return lines, None
+
+
+def emit(payload, dest):
+    """Write the redacted text, reporting a write failure instead of dumping a stack on it.
+    Returns None on success, or a message for the caller to print and exit non-zero on."""
+    try:
+        if dest:
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+        else:
+            sys.stdout.write(payload)
+            sys.stdout.flush()
+    except BrokenPipeError:
+        # `blot big.log | head -5` is a normal way to use this. Detach stdout so the interpreter's
+        # shutdown flush doesn't turn a clean run into a stack trace.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+    except (OSError, ValueError) as exc:
+        return "%s: %s" % (dest or "stdout", getattr(exc, "strerror", None) or exc)
+    return None
 
 
 def main(argv=None):
@@ -243,21 +297,32 @@ def main(argv=None):
         print("\n".join(sorted(set(types))))
         return 0
 
-    b = Blotter(stable=a.stable, keep=a.keep, pii=a.pii, paranoid=a.paranoid)
-    handles = [open(f, encoding="utf-8", errors="replace") for f in a.files]
-    src = []
-    for fh in handles:
-        src.extend(fh.read().split("\n"))
-    for fh in handles:
-        fh.close()
+    unknown = [k for k in a.keep if k.upper() not in ALL_TYPES]
+    if unknown:
+        # A typo in --keep would otherwise be silently ignored, and the type the user meant to
+        # spare gets blotted anyway — or worse, they believe something was spared that was not.
+        sys.stderr.write("%s: unknown --keep type(s): %s (see --list-types)\n"
+                         % (PROG, ", ".join(unknown)))
+        return 2
+
+    if not a.files and sys.stdin.isatty():
+        sys.stderr.write("%s: no files and nothing on stdin — pipe text in, name a file, or use "
+                         "--help\n" % PROG)
+        return 2
+
+    b = Blotter(stable=a.stable, keep=[k.upper() for k in a.keep], pii=a.pii, paranoid=a.paranoid)
+    src, err = read_input(a.files)
+    if err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return 2
 
     out_lines = list(b.stream_lines(src))
     text = "\n".join(out_lines)
-    if a.out:
-        with open(a.out, "w", encoding="utf-8") as fh:
-            fh.write(text if text.endswith("\n") else text + "\n")
-    else:
-        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    payload = (text if text.endswith("\n") or not text else text + "\n")
+    err = emit(payload, a.out)
+    if err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return 2
 
     if not a.quiet:
         kinds = " ".join("%s=%d" % (k, v) for k, v in sorted(b.counts.items()))
@@ -293,4 +358,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
