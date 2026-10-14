@@ -369,8 +369,14 @@ def main(argv=None):
     return 0
 
 
-if __name__ == "__main__":
+def cli():
+    """Entry point for both `python blot.py` and an installed console script, which imports main()
+    directly and so never reaches the __main__ guard below."""
     try:
-        sys.exit(main())
+        return main()
     except KeyboardInterrupt:
-        sys.exit(130)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

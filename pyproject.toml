@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blot"
+version = "1.0.0"
+description = "Take the live secrets out of text before you show it to anyone"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["redaction", "secrets", "credentials", "cli", "pentest", "bug-bounty"]
+authors = [{ name = "0xCyrildev" }]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+blot = "blot:cli"
+
+[project.urls]
+Homepage = "https://github.com/0xCyrildev/blot"
+
+[tool.setuptools]
+py-modules = ["blot"]

@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No dependency install step on purpose: blot is stdlib only, and if that ever stops
+      # being true this job is where it shows up.
+      - name: Byte-compile
+        run: python -m compileall -q blot.py tests
+
+      - name: Tests
+        run: python tests/test_blot.py -v
+
+  # The packaging is the product surface a user actually touches, so it gets exercised too.
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install .
+      - name: Run it the way a person would
+        run: |
+          echo 'password=hunter2secretvalue' | blot --verify
+          echo 'password=hunter2secretvalue' | blot > /dev/null
+          blot --list-types > /dev/null
+          blot --version

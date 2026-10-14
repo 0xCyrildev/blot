@@ -1,7 +1,6 @@
 """blot's own tests: every detector, and the four things that would make it dangerous to trust."""
-import io
-import re
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -245,6 +244,19 @@ class TestInputAndErrors(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn(b"<KV:1>", p.stdout)
         self.assertNotIn(b"hunter2secretvalue", p.stdout)
+
+
+    def test_ctrl_c_is_an_exit_code_not_a_traceback(self):
+        p = subprocess.Popen([sys.executable, CLI], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.5)  # blocked on a stdin that never sends anything, the way Ctrl-C finds it
+        p.send_signal(signal.SIGINT)
+        rc = p.wait(timeout=30)
+        err = p.stderr.read()
+        for fh in (p.stdout, p.stderr, p.stdin):
+            fh.close()
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(rc, 130, err)
 
 
 class TestEntropyGate(unittest.TestCase):
