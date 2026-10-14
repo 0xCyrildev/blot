@@ -29,6 +29,7 @@ import os
 import re
 import string
 import sys
+import time
 
 PROG = os.path.basename(sys.argv[0]).split(".")[0]
 VERSION = "1.1.1"
@@ -474,6 +475,29 @@ class Blotter:
             yield self.blot_line(raw.rstrip("\n"))[0]
 
 
+PROBE_STEPS = range(8, 27, 2)
+PROBE_BUDGET = 0.05
+
+
+def probe_rule(name, rx):
+    """A --rules regex is compiled as written, so a catastrophic one would hang the run rather than
+    fail it, and Python gives no way to interrupt a match already underway. So grow the input a
+    little at a time and refuse the first rule that stops being linear: an exponential matcher
+    crosses the budget within two or three steps, on a string nobody would call long, and the worst
+    time wasted is a few hundred milliseconds at load."""
+    for n in PROBE_STEPS:
+        for probe in ("a" * n, "a" * n + "!", "ab" * n + "!"):
+            started = time.monotonic()
+            try:
+                rx.search(probe)
+            except Exception as exc:  # a backreference or assertion that fails only at match time
+                return "%s: %s" % (name, exc)
+            if time.monotonic() - started > PROBE_BUDGET:
+                return ("%s: over %d ms on a %d-character probe — refusing it rather than risking "
+                        "a hang on real input" % (name, PROBE_BUDGET * 1000, n))
+    return None
+
+
 def load_rules(path):
     """Read a --rules file: a list of {"name","regex","screen"}, or an object with a "rules" list.
     Returns (rules, error). A malformed rule is an error rather than a skip: a detector that failed
@@ -500,6 +524,9 @@ def load_rules(path):
         if "sec" not in rx.groupindex:
             return None, "%s: rule %s has no (?P<sec>...) group, so nothing would be replaced" \
                          % (path, name)
+        err = probe_rule(name, rx)
+        if err:
+            return None, "%s: rule %s" % (path, err)
         rules.append((name, rx, tuple(str(s).lower() for s in r.get("screen") or ())))
     return rules, None
 

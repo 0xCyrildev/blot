@@ -571,6 +571,31 @@ class TestAgentSurface(unittest.TestCase):
         self.assertEqual(sum(doc["by_type"].values()), len(doc["findings"]),
                          "%s vs %s" % (doc["by_type"], len(doc["findings"])))
 
+    def test_a_catastrophic_custom_rule_is_refused_before_it_can_hang(self):
+        path = self._rules([{"name": "BOOM", "regex": r"(?P<sec>(?:a+)+b)"}])
+        try:
+            started = time.monotonic()
+            rc, out, err = run("--rules", path, stdin="x\n")
+            self.assertEqual(rc, 2, err)
+            self.assertIn("probe", err)
+            self.assertLess(time.monotonic() - started, 10,
+                            "a rule that will hang must be refused early, not eventually")
+        finally:
+            os.remove(path)
+
+    def test_an_ordinary_rule_still_loads_and_blots(self):
+        path = self._rules([{"name": "OK", "regex": r"(?i)(?P<keep>foo\s*[:=]\s*)(?P<sec>\S{8,})"}])
+        try:
+            rc, out, err = run("--rules", path, stdin="foo=abcdefgh\n")
+            self.assertEqual(rc, 0, err)
+            self.assertIn("<OK:1>", out)
+        finally:
+            os.remove(path)
+
+    def test_no_built_in_rule_is_catastrophic(self):
+        for name, rx, _screen in blot.RULES:
+            self.assertIsNone(blot.probe_rule(name, rx), "built-in %s fails its own probe" % name)
+
     def test_dump_rules_round_trips_back_through_rules(self):
         path = os.path.join(HERE, "_dump.json")
         rc, _o, err = run("--dump-rules", path)
