@@ -31,7 +31,7 @@ import string
 import sys
 
 PROG = os.path.basename(sys.argv[0]).split(".")[0]
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Named groups: `keep` is the context that stays visible (so a reader can still tell WHICH field was
 # blotted), `sec` is the secret, `q`/`tail` preserve quoting. Order matters: specific prefixed forms
