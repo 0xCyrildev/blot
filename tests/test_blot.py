@@ -225,6 +225,28 @@ class TestInputAndErrors(unittest.TestCase):
         self.assertEqual(rc, 0, err)
 
 
+    def test_the_map_refuses_to_overwrite_an_existing_file(self):
+        path = os.path.join(HERE, "_map.json")
+        with open(path, "w") as fh:
+            fh.write("the only copy of something important\n")
+        try:
+            rc, out, err = run("--map", path, stdin="password=hunter2supersecret\n")
+            self.assertEqual(rc, 2, err)
+            self.assertIn("cannot write the reverse map", err)
+            with open(path) as fh:
+                self.assertIn("only copy", fh.read(), "--map clobbered an existing map")
+        finally:
+            os.remove(path)
+
+    def test_undecodable_bytes_do_not_abort_a_redaction(self):
+        raw = b"blob \xff\xfe on a binary-ish line\npassword=hunter2secretvalue\n"
+        p = subprocess.run([sys.executable, CLI], input=raw, capture_output=True)
+        self.assertNotIn(b"Traceback", p.stderr)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(b"<KV:1>", p.stdout)
+        self.assertNotIn(b"hunter2secretvalue", p.stdout)
+
+
 class TestEntropyGate(unittest.TestCase):
     SHA = "4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8"
     OTHER = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"

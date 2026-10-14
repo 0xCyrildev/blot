@@ -231,7 +231,11 @@ def read_input(files):
     for name in files or ["-"]:
         try:
             if name == "-":
-                text = sys.stdin.read()
+                # Logs are routinely not valid UTF-8. Decoding strictly would raise halfway through a
+                # pipe and lose the redaction that was already done, so bytes come in and undecodable
+                # ones become U+FFFD, exactly as they do for a named file.
+                raw = getattr(sys.stdin, "buffer", None)
+                text = raw.read().decode("utf-8", "replace") if raw else sys.stdin.read()
             else:
                 with open(name, encoding="utf-8", errors="replace") as fh:
                     text = fh.read()
@@ -333,9 +337,17 @@ def main(argv=None):
                "" if total else "  — nothing matched, which is NOT evidence the text was clean",
                "  " + kinds if kinds else "  (none)"))
     if a.mapfile:
-        with open(a.mapfile, "w", encoding="utf-8") as fh:
+        # Created exclusive at 0600 instead of written then chmod'ed: in the window between those two
+        # calls, every secret from this run sat in a file the rest of the machine could read. An
+        # existing path is refused rather than overwritten — this file is usually the only copy.
+        try:
+            fd = os.open(a.mapfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            sys.stderr.write("%s: cannot write the reverse map to %s: %s\n"
+                             % (PROG, a.mapfile, getattr(exc, "strerror", None) or exc))
+            return 2
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(b.labels, fh, indent=1, sort_keys=True)
-        os.chmod(a.mapfile, 0o600)
         sys.stderr.write("%s: reverse map -> %s (0600). Publish that file and you have published "
                          "every secret in here.\n" % (PROG, a.mapfile))
 
