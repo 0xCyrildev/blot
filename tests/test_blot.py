@@ -211,6 +211,17 @@ class TestKeyNames(unittest.TestCase):
             ("TWILIOSID", "account_sid=AC" + "0123456789abcdef" * 2),
             ("SLACKWEBHOOK", "https://hooks.slack.com/services/T000/B000/" + "Z" * 24),
             ("DISCORDHOOK", "https://discord.com/api/webhooks/123456789012345678/" + "Y" * 30),
+            ("DIGITALOCEAN", "x=dop_v1_" + "0" * 64),
+            ("VAULT", "x=hvs_" + "a" * 24),
+            ("DOCKERHUB", "x=dckr_pat_" + "b" * 27),
+            ("NEWRELIC", "x=NRAK-" + "C" * 24),
+            ("B64PEM", "TF_VAR_key=LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t"),
+            ("AZURE", "Endpoint=sb://x.servicebus.windows.net/;SharedAccessKeyName=ro;"
+                      "AccountKey=" + "dGhpcyBpc250YSByZWFsIGtleSBidXQgaXQgaXMgbG9uZw==" * 2),
+            ("JWK", '{"kty":"RSA","e":"AQAB","d":"RbTj9xV3zQnZqQmW3kK7pQj4dZ3cR7pQj4dZ3cR7pQj4dZ"}'),
+            ("HDR", "x-api-key: abcdefghijklmnop1234"),
+            ("AUTHSCHEME", "Authorization: ssws abcdefghijklmnop1234"),
+            ("AUTHHEADER", "Authorization: 03af9d2b1c5e7f8a9b0c1d2e3f4a5b6c"),
         ]:
             out, hits = blot.Blotter().blot_line(line)
             self.assertTrue(hits, "%s not blotted: %s" % (typ, line))
@@ -257,6 +268,16 @@ class TestScreens(unittest.TestCase):
                   "https://discord.com/api/webhooks/123456789012345678/" + "Y" * 30):
             cases.append("account_sid=" + v)
             cases.append("x=" + v)
+        cases += [
+            "x=dop_v1_" + "0" * 64, "x=hvs_" + "a" * 24, "x=dckr_pat_" + "b" * 27,
+            "x=NRAK-" + "C" * 24,
+            "TF_VAR_key=LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t",
+            "AccountKey=" + "dGhpcyBpc250YSByZWFsIGtleSBidXQgaXQgaXMgbG9uZw==" * 2,
+            '{"kty":"RSA","e":"AQAB","d":"RbTj9xV3zQnZqQmW3kK7pQj4dZ3cR7pQj4dZ3cR7pQj4dZ"}',
+            "x-api-key: abcdefghijklmnop1234",
+            "Authorization: ssws abcdefghijklmnop1234",
+            "Authorization: 03af9d2b1c5e7f8a9b0c1d2e3f4a5b6c",
+        ]
         for n in ("password", "passwd", "pass", "pwd", "secret", "secret_key", "secret_key_base",
                   "api_key", "apikey", "app_key", "master_key", "encryption_key", "signing_key",
                   "access_key", "access_key_id", "access_token", "private_key", "auth_token",

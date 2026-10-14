@@ -70,6 +70,26 @@ RULES = [
     ("GOOAUTH", re.compile(r"\b(?P<sec>ya29\.[A-Za-z0-9_\-]{25,})"), ("ya29.",)),
     ("TWILIOSID", re.compile(
         r"(?i)(?P<keep>\baccount[_-]?sid\s*[:=]\s*)(?P<sec>(?:AC|SK)[0-9a-f]{32})\b"), ("sid",)),
+    ("DIGITALOCEAN", re.compile(r"\b(?P<sec>dop_v1_[0-9a-f]{64})\b"), ("dop_v1_",)),
+    ("VAULT", re.compile(r"\b(?P<sec>hvs_[A-Za-z0-9]{20,})\b"), ("hvs_",)),
+    ("DOCKERHUB", re.compile(r"\b(?P<sec>dckr_pat_[A-Za-z0-9]{24,})\b"), ("dckr_pat_",)),
+    ("NEWRELIC", re.compile(r"\b(?P<sec>NRAK-[A-Z0-9]{20,})\b"), ("nrak-",)),
+    # A PEM block that arrived base64'd onto one line — what a secret looks like inside JSON, an env
+    # var or a Terraform tfvars file, where the ----- markers the PEM state machine waits for never
+    # appear. "LS0tLS1CRUdJTi" is `-----BEGIN` in base64, so it cannot fire on ordinary text.
+    ("B64PEM", re.compile(r"\b(?P<sec>LS0tLS1CRUdJTi[A-Za-z0-9+/=]{20,})"), ("ls0tls1crudjti",)),
+    ("AZURE", re.compile(
+        r"(?i)(?P<keep>\baccountkey\s*[:=]\s*)(?P<sec>[A-Za-z0-9+/]{40,}={0,2})"), ("accountkey",)),
+    # A JWK's "d" is the private exponent. Requiring "kty" in the same span is what keeps this off
+    # every other `"d":` in the world — a description, a dimension, a debug flag.
+    ("JWK", re.compile(
+        r'''(?i)"kty"\s*:\s*"[A-Za-z]+"\s*,[^{}]*?"d"\s*:\s*"(?P<sec>[A-Za-z0-9+/=]{20,})"'''),
+     ('"kty"',)),
+    # Header names that always carry a credential, and are not "authorization".
+    ("HDR", re.compile(
+        r"(?i)(?P<keep>\b(?:x-api-key|x-goog-api-key|x-amz-security-token|anthropic-api-key|"
+        r"openai-api-key|x-slack-token|x-linkedin-access-token)\s*[:=]\s*)"
+        r"(?P<sec>[^\s\"']{12,})"), ("key", "token")),
     ("STRIPE", re.compile(r"\b(?P<sec>(?:sk|pk|rk)_(?:live|test)_[0-9A-Za-z]{10,})\b"),
      ("sk_live_", "sk_test_", "pk_live_", "pk_test_", "rk_live_", "rk_test_")),
     ("LLMTOKEN", re.compile(r"\b(?P<sec>sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,})\b"), ("sk-",)),
@@ -85,6 +105,14 @@ RULES = [
         r"(?i)(?P<keep>\b(?:authorization|proxy-authorization|x-api-token)\s*[:=]\s*)?"
         r"(?P<sec>bearer\s+[A-Za-z0-9._~+/=-]{12,})"), ("bearer",)),
     ("BASIC", re.compile(r"(?i)(?P<keep>\bbasic\s+)(?P<sec>[A-Za-z0-9+/]{12,}={0,2})"), ("basic",)),
+    ("AUTHSCHEME", re.compile(
+        r"(?i)(?P<keep>\b(?:ssws|dhba|aws4-hmac-sha256)\s+)(?P<sec>[A-Za-z0-9._~+/=\-]{16,})"),
+     ("ssws", "dhba", "aws4-hmac-sha256")),
+    # `Authorization: <bare token>` with no scheme word at all, which API gateways do constantly.
+    # Runs after BEARER/BASIC/AUTHSCHEME, and its lookahead leaves their work to them.
+    ("AUTHHEADER", re.compile(
+        r"(?i)(?P<keep>\bauthorization\s*[:=]\s*)(?!bearer\b|basic\b|digest\b|ssws\b|dhba\b)"
+        r"(?P<sec>[A-Za-z0-9._~+/=\-]{16,})"), ("authorization",)),
     ("COOKIE", re.compile(
         r"(?i)(?P<keep>\b(?:cookie|set-cookie)\s*[:=]\s*)(?P<sec>[^\r\n\"']{8,})"), ("cookie",)),
     # Curated on purpose, not `.*key.*=`: over-redacting a log is also a failure, and it is the one
