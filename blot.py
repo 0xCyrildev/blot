@@ -26,22 +26,37 @@ VERSION = "1.0.0"
 # Named groups: `keep` is the context that stays visible (so a reader can still tell WHICH field was
 # blotted), `sec` is the secret, `q`/`tail` preserve quoting. Order matters: specific prefixed forms
 # first, generic key=value next, so a `token: ghp_...` line reports as GHTOKEN and not KV.
+#
+# The third field is a screen: literals such that ANY text the regex can match must contain at least
+# one of them, case-insensitively. It is a necessary condition, never a heuristic — a screen that is
+# wrong in that direction silently loses secrets, which is the one failure this tool cannot have. The
+# regexes are long alternations and cost ~40x what a substring test costs on a line that cannot match
+# (KV alone was 8.5s of an 18s run over a 12 MB log). An empty tuple means "always run it".
 RULES = [
-    ("AWS", re.compile(r"\b(?P<sec>(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANVA|APINA)[0-9A-Z]{12,20})\b")),
-    ("GHTOKEN", re.compile(r"\b(?P<sec>gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")),
-    ("GOOGLEKEY", re.compile(r"\b(?P<sec>AIza[0-9A-Za-z_\-]{30,40})\b")),
-    ("SLACK", re.compile(r"\b(?P<sec>xox[baprs]-[0-9A-Za-z-]{10,})\b")),
-    ("STRIPE", re.compile(r"\b(?P<sec>(?:sk|pk|rk)_(?:live|test)_[0-9A-Za-z]{10,})\b")),
-    ("LLMTOKEN", re.compile(r"\b(?P<sec>sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,})\b")),
+    ("AWS", re.compile(r"\b(?P<sec>(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANVA|APINA)[0-9A-Z]{12,20})\b"),
+     ("akia", "asia", "aida", "aroa", "agpa", "aipa", "anva", "apina")),
+    ("GHTOKEN", re.compile(r"\b(?P<sec>gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+     ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")),
+    ("GOOGLEKEY", re.compile(r"\b(?P<sec>AIza[0-9A-Za-z_\-]{30,40})\b"), ("aiza",)),
+    ("SLACK", re.compile(r"\b(?P<sec>xox[baprs]-[0-9A-Za-z-]{10,})\b"),
+     ("xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-")),
+    ("STRIPE", re.compile(r"\b(?P<sec>(?:sk|pk|rk)_(?:live|test)_[0-9A-Za-z]{10,})\b"),
+     ("sk_live_", "sk_test_", "pk_live_", "pk_test_", "rk_live_", "rk_test_")),
+    ("LLMTOKEN", re.compile(r"\b(?P<sec>sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,})\b"), ("sk-",)),
     # eyJ is `{"` in base64url; every real JWT starts with it, so this cannot hit ordinary prose.
-    ("JWT", re.compile(r"\b(?P<sec>eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{8,})")),
+    # The screen is "eyj" because screens are tested against the lowercased line — the literal this
+    # one screens for is mixed case, and a screen copied from the regex would never fire.
+    ("JWT", re.compile(r"\b(?P<sec>eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{8,})"),
+     ("eyj",)),
     ("URLCREDS", re.compile(
-        r"(?P<sec>[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@'\"]{1,64}:[^\s@/'\"]{1,128}@[^\s/'\"]*)")),
+        r"(?P<sec>[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@'\"]{1,64}:[^\s@/'\"]{1,128}@[^\s/'\"]*)"),
+     ("://",)),
     ("BEARER", re.compile(
         r"(?i)(?P<keep>\b(?:authorization|proxy-authorization|x-api-token)\s*[:=]\s*)?"
-        r"(?P<sec>bearer\s+[A-Za-z0-9._~+/=-]{12,})")),
-    ("BASIC", re.compile(r"(?i)(?P<keep>\bbasic\s+)(?P<sec>[A-Za-z0-9+/]{12,}={0,2})")),
-    ("COOKIE", re.compile(r"(?i)(?P<keep>\b(?:cookie|set-cookie)\s*[:=]\s*)(?P<sec>[^\r\n\"']{8,})")),
+        r"(?P<sec>bearer\s+[A-Za-z0-9._~+/=-]{12,})"), ("bearer",)),
+    ("BASIC", re.compile(r"(?i)(?P<keep>\bbasic\s+)(?P<sec>[A-Za-z0-9+/]{12,}={0,2})"), ("basic",)),
+    ("COOKIE", re.compile(
+        r"(?i)(?P<keep>\b(?:cookie|set-cookie)\s*[:=]\s*)(?P<sec>[^\r\n\"']{8,})"), ("cookie",)),
     # Curated on purpose, not `.*key.*=`: over-redacting a log is also a failure, and it is the one
     # that quietly destroys the report you were trying to publish. Long tail -> --paranoid.
     ("KV", re.compile(
@@ -50,12 +65,13 @@ RULES = [
         r"access[_-]?key(?:[_-]?id)?|access[_-]?token|private[_-]?key|auth[_-]?token|"
         r"refresh[_-]?token|session[_-]?token|bearer[_-]?token|id[_-]?token|token|seed|mnemonic|"
         r"recovery[_-]?phrase|otp|client[_-]?secret|webhook[_-]?secret)"
-        r"[\"']?\s*[:=]\s*)(?P<q>[\"']?)(?P<sec>[^\"'\s,;}\]]{5,})(?P<tail>(?P=q))")),
+        r"[\"']?\s*[:=]\s*)(?P<q>[\"']?)(?P<sec>[^\"'\s,;}\]]{5,})(?P<tail>(?P=q))"),
+     ("pass", "pwd", "secret", "key", "token", "seed", "mnemonic", "recovery", "phrase", "otp")),
 ]
 
-PII = (("EMAIL", re.compile(r"\b[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+\b")),
-       ("IPV4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
-       ("PHONE", re.compile(r"\b(?:\+?\d[\d\s\-()]{8,14}\d)\b")))
+PII = (("EMAIL", re.compile(r"\b[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+\b"), ("@",)),
+       ("IPV4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), (".",)),
+       ("PHONE", re.compile(r"\b(?:\+?\d[\d\s\-()]{8,14}\d)\b"), ()))
 
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
@@ -87,7 +103,7 @@ PARANOID_MIN_BITS = 3.0
 LABEL_INNER = re.compile(r"<[A-Z]+:[^>]*>?", re.I)
 
 
-ALL_TYPES = {t for t, _ in RULES} | {t for t, _ in PII} | {"PRIVKEY", "SEEDPHRASE", "ENTROPY"}
+ALL_TYPES = {t for t, _, _ in RULES} | {t for t, _, _ in PII} | {"PRIVKEY", "SEEDPHRASE", "ENTROPY"}
 
 
 def near(text, lo, hi, window=CTX_WINDOW):
@@ -109,11 +125,14 @@ def entropy(tok):
 class Blotter:
     """One Blotter per run: the label table lives here, which is what makes redaction consistent."""
 
-    def __init__(self, stable=False, keep=(), pii=False, paranoid=False):
+    def __init__(self, stable=False, keep=(), pii=False, paranoid=False, screen=True):
         self.stable = stable
         self.keep = {k.upper() for k in keep}
         self.pii = pii
         self.paranoid = paranoid
+        # screen=False runs every regex on every line whether or not it can match. It exists so the
+        # suite can prove the screens cost nothing in correctness, not just in seconds.
+        self.screen = screen
         self.labels = {}
         self.counts = {}
         self.lines = 0
@@ -182,19 +201,26 @@ class Blotter:
             if len(words) in SEED_COUNTS and len(SEED_HINT & set(words)) >= 2:
                 out = out[:sm.start()] + self.label("SEEDPHRASE", sm.group(0)) + out[sm.end():]
                 hits += 1
-        for typ, rx in RULES:
+        low = out.lower()
+        for typ, rx, screen in RULES:
             if typ in self.keep:
+                continue
+            if self.screen and screen and not any(s in low for s in screen):
                 continue
             new, n = self._apply(out, typ, rx)
             if n:
                 out, hits = new, hits + n
+                low = out.lower()
         if self.pii:
-            for typ, rx in PII:
+            for typ, rx, screen in PII:
                 if typ in self.keep:
+                    continue
+                if self.screen and screen and not any(s in low for s in screen):
                     continue
                 new, n = self._apply(out, typ, rx)
                 if n:
                     out, hits = new, hits + n
+                    low = out.lower()
         if self.paranoid:
             out, n = self._entropy_pass(out)
             hits += n
@@ -297,9 +323,9 @@ def main(argv=None):
         print("%s %s" % (PROG, VERSION))
         return 0
     if a.list_types:
-        types = [t for t, _ in RULES] + ["PRIVKEY", "SEEDPHRASE"]
+        types = [t for t, _, _ in RULES] + ["PRIVKEY", "SEEDPHRASE"]
         if a.pii:
-            types += [t for t, _ in PII]
+            types += [t for t, _, _ in PII]
         if a.paranoid:
             types.append("ENTROPY")
         print("\n".join(sorted(set(types))))

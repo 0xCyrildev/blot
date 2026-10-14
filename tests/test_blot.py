@@ -189,6 +189,68 @@ class TestKeyNames(unittest.TestCase):
         self.assertIn("<ENTROPY", out)
 
 
+class TestScreens(unittest.TestCase):
+    """Each rule carries a screen: literals that ANY match must contain. That is a claim about the
+    regex, and getting it backwards silently loses secrets. So: run the whole corpus with screens on
+    and off and demand identical output, and enumerate every alternation branch because that is
+    where a screen breaks."""
+
+    @staticmethod
+    def corpus():
+        cases = []
+        for pre in ("AKIA", "ASIA", "AIDA", "AROA", "AGPA", "AIPA", "ANVA", "APINA"):
+            cases.append("x=%s%s" % (pre, "B" * 16))
+        for p in ("ghp", "gho", "ghu", "ghs", "ghr"):
+            cases.append("x=%s_%s" % (p, "a" * 24))
+        cases.append("x=github_pat_" + "a" * 24 + "_" + "b" * 24)
+        for t in ("xoxb", "xoxa", "xoxp", "xoxr", "xoxs"):
+            cases.append("x=%s-%s" % (t, "c" * 12))
+        for a in ("sk", "pk", "rk"):
+            for e in ("live", "test"):
+                cases.append("x=%s_%s_%s" % (a, e, "d" * 12))
+        for s in ("sk-", "sk-ant-", "sk-proj-"):
+            cases.append("x=" + s + "e" * 24)
+        cases.append("x=AIza" + "F" * 35)
+        cases.append("x=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.aaaaaaaaaaaaaaaaaaaaa")
+        cases.append("postgres://deploy:Sup3rS3cret@db.internal:5432/app")
+        cases.append("Authorization: Bearer abcdefghijklmnop")
+        cases.append("basic U2VjcmV0VmFsdWU=")
+        cases.append("Cookie: session=abcdefghijklmnop")
+        for n in ("password", "passwd", "pass", "pwd", "secret", "secret_key", "secret_key_base",
+                  "api_key", "apikey", "app_key", "master_key", "encryption_key", "signing_key",
+                  "access_key", "access_key_id", "access_token", "private_key", "auth_token",
+                  "refresh_token", "session_token", "bearer_token", "id_token", "token", "seed",
+                  "mnemonic", "recovery_phrase", "otp", "client_secret", "webhook_secret"):
+            cases.append('%s="Sup3rS3cretValue"' % n)
+            cases.append("%s: Sup3rS3cretValue" % n.upper())
+        cases += ["nothing to see here, just a log line",
+                  "commit 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8",
+                  "GET /api/v1/users?page=2 200 14ms"]
+        return cases
+
+    def setUp(self):
+        self.cases = self.corpus()
+
+    def test_screens_change_speed_and_nothing_else(self):
+        for line in self.cases:
+            for flags in ({}, {"pii": True}, {"paranoid": True}, {"pii": True, "paranoid": True}):
+                on = blot.Blotter(screen=True, **flags).blot_line(line)
+                off = blot.Blotter(screen=False, **flags).blot_line(line)
+                self.assertEqual(on, off, "screens changed %r with %r" % (line, flags))
+
+    def test_the_corpus_still_matches_so_the_comparison_is_not_vacuous(self):
+        hit = sum(1 for l in self.cases if blot.Blotter().blot_line(l)[1])
+        self.assertGreater(hit, int(len(self.cases) * 0.9),
+                           "only %d of %d lines matched; the corpus stopped exercising the rules"
+                           % (hit, len(self.cases)))
+
+    def test_a_screen_literal_that_only_appears_in_a_placeholder_cannot_hide_a_real_secret(self):
+        # Labels are uppercase words like <LLMTOKEN:1>, which lowercase to text containing "token"
+        # and "key". A later rule must not be skipped because the literal arrived via a label.
+        line = "token=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and password=Sup3rS3cretValue"
+        self.assertEqual(blot.Blotter().blot_line(line), blot.Blotter(screen=False).blot_line(line))
+
+
 class TestInputAndErrors(unittest.TestCase):
     """The failure modes that make a redactor unsafe to trust: silently doing nothing."""
 
