@@ -1,10 +1,13 @@
 """blot's own tests: every detector, and the four things that would make it dangerous to trust."""
+import atexit
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -13,6 +16,14 @@ import blot  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI = os.path.join(os.path.dirname(HERE), "blot.py")
+# Somewhere outside the repository: blot refuses to write a reverse map inside a git work tree, so
+# the tests that exercise --map have to ask for a directory that is not one.
+TMP = tempfile.mkdtemp(prefix="blot-tests-")
+atexit.register(shutil.rmtree, TMP, True)
+
+
+def scratch(name):
+    return os.path.join(TMP, name)
 
 AWS = "AKIAIOSFODNN7EXAMPLE"
 JWT = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
@@ -322,7 +333,7 @@ class TestInputAndErrors(unittest.TestCase):
         self.assertIn("<GHTOKEN:1>", out)
 
     def test_dash_reads_stdin_even_next_to_a_file(self):
-        path = os.path.join(HERE, "_in.txt")
+        path = scratch("_in.txt")
         with open(path, "w") as fh:
             fh.write("a " + AWS + "\n")
         try:
@@ -376,7 +387,7 @@ class TestInputAndErrors(unittest.TestCase):
 
 
     def test_the_map_refuses_to_overwrite_an_existing_file(self):
-        path = os.path.join(HERE, "_map.json")
+        path = scratch("_map.json")
         with open(path, "w") as fh:
             fh.write("the only copy of something important\n")
         try:
@@ -411,7 +422,7 @@ class TestInputAndErrors(unittest.TestCase):
 
 
     def test_crlf_line_endings_survive_the_round_trip(self):
-        path = os.path.join(HERE, "_crlf.txt")
+        path = scratch("_crlf.txt")
         with open(path, "w", newline="") as fh:
             fh.write("password=hunter2secretvalue\r\ntoken=ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5\r\n")
         try:
@@ -425,7 +436,7 @@ class TestInputAndErrors(unittest.TestCase):
             os.remove(path)
 
     def test_a_binary_is_refused_rather_than_written_out(self):
-        path = os.path.join(HERE, "_bin.dat")
+        path = scratch("_bin.dat")
         with open(path, "wb") as fh:
             fh.write(b"\x7fELF\x00\x00password=hunter2secretvalue\x00")
         try:
@@ -433,6 +444,36 @@ class TestInputAndErrors(unittest.TestCase):
             self.assertEqual(rc, 2, err)
             self.assertIn("NUL", err)
             self.assertEqual(out, "", "binary content reached stdout")
+        finally:
+            os.remove(path)
+
+
+class TestMapGuard(unittest.TestCase):
+    """The reverse map is the one file whose leak is total. blot refuses the two ways that happens:
+    a world-readable moment while writing, and landing in a repository."""
+
+    SECRET_LINE = "password=hunter2supersecret\n"
+
+    def test_a_map_is_refused_inside_a_git_work_tree(self):
+        path = os.path.join(HERE, "_map.json")
+        self.assertTrue(blot.in_git_worktree(HERE), "this test file should be inside a repo")
+        rc, out, err = run("--map", path, stdin=self.SECRET_LINE)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("work tree", err)
+        self.assertFalse(os.path.exists(path), "refused it, then wrote it anyway")
+
+    def test_a_map_outside_a_work_tree_needs_no_force(self):
+        rc, out, err = run("--map", scratch("_map.json"), stdin=self.SECRET_LINE)
+        self.assertEqual(rc, 0, err)
+
+    def test_force_lets_a_map_land_in_a_work_tree_and_replace_itself(self):
+        path = os.path.join(HERE, "_map.json")
+        try:
+            rc, out, err = run("--map", path, "--force", stdin=self.SECRET_LINE)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(oct(os.stat(path).st_mode)[-3:], "600")
+            rc2, _o, err2 = run("--map", path, "--force", stdin="password=anothersecretvalue\n")
+            self.assertEqual(rc2, 0, err2)
         finally:
             os.remove(path)
 
@@ -473,7 +514,7 @@ class TestStrict(unittest.TestCase):
         self.assertIn("verify OK", err)
 
     def test_a_learned_rule_turns_the_refusal_into_a_pass(self):
-        path = os.path.join(HERE, "_rules.json")
+        path = scratch("_rules.json")
         with open(path, "w") as fh:
             json.dump([{"name": "MY_VENDOR_KEY",
                         "regex": r"(?i)(?P<keep>\bmy_vendor_key\s*[:=]\s*)(?P<sec>\S{8,})"}], fh)
@@ -504,7 +545,7 @@ class TestAgentSurface(unittest.TestCase):
                "4111111111111111")
 
     def _rules(self, doc):
-        path = os.path.join(HERE, "_rules.json")
+        path = scratch("_rules.json")
         with open(path, "w") as fh:
             json.dump(doc, fh)
         return path
@@ -597,7 +638,7 @@ class TestAgentSurface(unittest.TestCase):
             self.assertIsNone(blot.probe_rule(name, rx), "built-in %s fails its own probe" % name)
 
     def test_dump_rules_round_trips_back_through_rules(self):
-        path = os.path.join(HERE, "_dump.json")
+        path = scratch("_dump.json")
         rc, _o, err = run("--dump-rules", path)
         try:
             self.assertEqual(rc, 0, err)
@@ -620,7 +661,7 @@ class TestCli(unittest.TestCase):
         self.assertIn("ENTROPY", out)
 
     def test_map_file_is_written_private_and_warned(self):
-        path = os.path.join(HERE, "_map.json")
+        path = scratch("_map.json")
         rc, out, err = run("--map", path, stdin="password=hunter2supersecret\n")
         try:
             self.assertEqual(rc, 0, err)
@@ -633,7 +674,7 @@ class TestCli(unittest.TestCase):
                 os.remove(path)
 
     def test_out_file_matches_stdout(self):
-        path = os.path.join(HERE, "_out.txt")
+        path = scratch("_out.txt")
         rc1, so, _ = run(stdin="token %s\n" % GH)
         rc2, _o, err = run("--out", path, stdin="token %s\n" % GH)
         try:

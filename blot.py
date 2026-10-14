@@ -543,6 +543,20 @@ def dump_rules(path):
     return None
 
 
+def in_git_worktree(path):
+    """The nearest .git above the directory `path` would be written to, or None. The classic way a
+    reverse map leaks is not a permissions slip — it is one `git add -A` away, because the map is
+    written next to the file being redacted and that file is usually in a repository."""
+    d = os.path.abspath(os.path.dirname(path) or ".")
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
 def read_input(files):
     """Lines from the named files, or from stdin when none are given; `-` always means stdin.
     Returns (lines, error) — a missing file is a message, not a traceback."""
@@ -604,6 +618,8 @@ def main(argv=None):
                          "across SEPARATE runs (default numbering is per-run)")
     ap.add_argument("--map", dest="mapfile", metavar="FILE",
                     help="write the reverse table here, mode 0600 — this file holds every secret")
+    ap.add_argument("--force", action="store_true",
+                    help="let --map replace an existing file, or land inside a git work tree")
     ap.add_argument("--keep", action="append", default=[], metavar="TYPE",
                     help="do not blot this type (repeatable)")
     ap.add_argument("--pii", action="store_true", help="also blot emails, IPv4 addresses, phone numbers")
@@ -712,14 +728,23 @@ def main(argv=None):
                              "still not proof that nothing is\n" % PROG)
 
     if a.mapfile:
+        root = in_git_worktree(a.mapfile)
+        if root and not a.force:
+            sys.stderr.write(
+                "%s: refusing to write the reverse map inside the git work tree at %s. That file "
+                "holds every secret from this run and is one `git add -A` from being public — write "
+                "it outside the tree, or pass --force if you have ignored it.\n" % (PROG, root))
+            return 2
         # Created exclusive at 0600 instead of written then chmod'ed: in the window between those two
         # calls, every secret from this run sat in a file the rest of the machine could read. An
         # existing path is refused rather than overwritten — this file is usually the only copy.
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if a.force else os.O_EXCL)
         try:
-            fd = os.open(a.mapfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(a.mapfile, flags, 0o600)
         except OSError as exc:
-            sys.stderr.write("%s: cannot write the reverse map to %s: %s\n"
-                             % (PROG, a.mapfile, getattr(exc, "strerror", None) or exc))
+            sys.stderr.write("%s: cannot write the reverse map to %s: %s%s\n"
+                             % (PROG, a.mapfile, getattr(exc, "strerror", None) or exc,
+                                "" if a.force else " (pass --force to replace an existing map)"))
             return 2
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(b.labels, fh, indent=1, sort_keys=True)
