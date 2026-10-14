@@ -591,12 +591,17 @@ def main(argv=None):
     ap.add_argument("--candidates", action="store_true",
                     help="report what survived, described rather than quoted, for a reviewer or an "
                          "agent to adjudicate")
+    ap.add_argument("--strict", action="store_true",
+                    help="with --verify: exit 4 unless the candidate sweep is empty too, so an "
+                         "unnamed secret-shaped survivor cannot be certified clean")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable findings on stdout; the redacted text then needs --out")
     ap.add_argument("--list-types", action="store_true",
                     help="print every type blot can blot, honouring --pii/--paranoid/--rules")
     ap.add_argument("--version", action="store_true", help="print the version and exit")
     a = ap.parse_args(argv)
+    if a.strict:
+        a.verify = True   # --strict is the safe single command; verifying is part of what it means
 
     if a.version:
         print("%s %s" % (PROG, VERSION))
@@ -641,7 +646,7 @@ def main(argv=None):
         return 2
 
     b = Blotter(stable=a.stable, keep=[k.upper() for k in a.keep], pii=a.pii,
-                paranoid=a.paranoid, rules=custom, candidates=a.candidates or a.json)
+                paranoid=a.paranoid, rules=custom, candidates=a.candidates or a.json or a.strict)
     src, err = read_input(a.files)
     if err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
@@ -665,7 +670,7 @@ def main(argv=None):
                "" if total else "  — nothing matched, which is NOT evidence the text was clean",
                "  " + kinds if kinds else "  (none)"))
 
-    rows = b.candidate_report() if (a.candidates or a.json) else []
+    rows = b.candidate_report() if (a.candidates or a.json or a.strict) else []
     if a.candidates and not a.json:
         for c in rows[:40]:
             sys.stderr.write("%s: %-7s %-20s %-9s %-16s x%-4d line %d\n"
@@ -710,7 +715,7 @@ def main(argv=None):
         print(json.dumps({"version": VERSION, "inputs": a.files or ["-"], "lines": b._lineno,
                           "blotted": sum(b.counts.values()), "distinct": len(b.labels),
                           "by_type": dict(sorted(b.counts.items())), "findings": b.findings,
-                          "findings_truncated": b.findings_capped, "candidates": rows,
+                          "findings_truncated": b.findings_capped, "candidates": rows, "strict": a.strict,
                           "verify": {"clean": not live, "lines": live[:200]} if a.verify else None},
                          indent=1, sort_keys=True))
 
@@ -719,6 +724,12 @@ def main(argv=None):
             sys.stderr.write("%s: NOT CLEAN — something recognisable is still live on line(s) %s\n"
                              % (PROG, ", ".join(map(str, live[:20]))))
             return 3
+        if a.strict and rows:
+            names = ", ".join(sorted({c["site"] or c["kind"] for c in rows})[:6])
+            sys.stderr.write("%s: UNNAMED — nothing recognised is live, but %d shape(s) still look "
+                             "secret-shaped and no rule covers them: %s\n"
+                             % (PROG, len(rows), names))
+            return 4
         sys.stderr.write("%s: verify OK — no recognised secret remains in the output\n" % PROG)
     return 0
 

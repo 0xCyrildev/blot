@@ -456,6 +456,41 @@ class TestEntropyGate(unittest.TestCase):
         self.assertIn("<ENTROPY", out, "a hex value 400 chars from `commit` is not a git sha")
 
 
+class TestStrict(unittest.TestCase):
+    """--verify can only see what has a rule. --strict is the refusal to call that clean, and the
+    point of the pair is the difference between their exit codes."""
+
+    UNKNOWN = "MY_VENDOR_KEY=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6\n"
+
+    def test_strict_refuses_to_certify_a_shape_no_rule_covers(self):
+        rc, out, err = run("--strict", stdin=self.UNKNOWN)
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("UNNAMED", err)
+
+    def test_verify_alone_still_passes_where_strict_refuses(self):
+        rc, out, err = run("--verify", stdin=self.UNKNOWN)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("verify OK", err)
+
+    def test_a_learned_rule_turns_the_refusal_into_a_pass(self):
+        path = os.path.join(HERE, "_rules.json")
+        with open(path, "w") as fh:
+            json.dump([{"name": "MY_VENDOR_KEY",
+                        "regex": r"(?i)(?P<keep>\bmy_vendor_key\s*[:=]\s*)(?P<sec>\S{8,})"}], fh)
+        try:
+            rc, out, err = run("--strict", "--rules", path, stdin=self.UNKNOWN)
+            self.assertEqual(rc, 0, out + err)
+            self.assertNotIn("UNNAMED", err)
+            self.assertNotIn("a1b2c3d4", out)
+        finally:
+            os.remove(path)
+
+    def test_a_recognised_leak_outranks_an_unnamed_shape(self):
+        rc, out, err = run("--strict", "--keep", "AWS", stdin="aws %s %s" % (AWS, self.UNKNOWN))
+        self.assertEqual(rc, 3, out + err)
+        self.assertIn("NOT CLEAN", err)
+
+
 class TestAgentSurface(unittest.TestCase):
     """--rules, --candidates and --json are how an agent drives blot. The property that matters:
     the report describes what survived without ever quoting it, so reading the report is not a
