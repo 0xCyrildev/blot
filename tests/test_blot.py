@@ -372,18 +372,24 @@ class TestInputAndErrors(unittest.TestCase):
         self.assertIn(AWS, out)
 
     def test_a_closed_consumer_is_not_reported_as_a_failure(self):
-        big = "".join("line %d token %s\n" % (i, GH) for i in range(20000))
-        p = subprocess.Popen([sys.executable, CLI], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        p.stdin.write(big)
-        p.stdin.close()
-        p.stdout.readline()
-        p.stdout.close()  # the consumer went away mid-stream, the way `| head -1` does
-        err = p.stderr.read()
-        rc = p.wait(timeout=60)
-        p.stderr.close()
-        self.assertNotIn("Traceback", err)
-        self.assertEqual(rc, 0, err)
+        # A file for stdin, not a pipe: blot streams now, so a parent that writes all of a 1 MB
+        # input before reading any of it deadlocks on pipe buffers — the same way `cat` does. The
+        # usage under test is `blot big.log | head -1`, which is exactly this shape.
+        path = scratch("_closed.txt")
+        with open(path, "w") as fh:
+            fh.write("".join("line %d token %s\n" % (i, GH) for i in range(20000)))
+        try:
+            p = subprocess.Popen([sys.executable, CLI, path], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+            p.stdout.readline()
+            p.stdout.close()  # the consumer went away mid-stream, the way `| head -1` does
+            err = p.stderr.read()
+            rc = p.wait(timeout=60)
+            p.stderr.close()
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(rc, 0, err)
+        finally:
+            os.remove(path)
 
 
     def test_the_map_refuses_to_overwrite_an_existing_file(self):

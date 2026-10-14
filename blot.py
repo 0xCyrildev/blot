@@ -23,6 +23,7 @@ built-in set instead of from nothing.
 """
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
@@ -516,11 +517,6 @@ class Blotter:
             else:
                 pos = m.end("sec")
 
-    def stream_lines(self, lines):
-        for raw in lines:
-            yield self.blot_line(raw.rstrip("\n"))[0]
-
-
 PROBE_STEPS = range(8, 27, 2)
 PROBE_BUDGET = 0.05
 
@@ -603,43 +599,103 @@ def in_git_worktree(path):
         d = parent
 
 
-def read_input(files):
-    """Lines from the named files, or from stdin when none are given; `-` always means stdin.
-    Returns (lines, error) — a missing file is a message, not a traceback."""
-    lines = []
+class InputError(Exception):
+    """A source that cannot be read, or is not text. Reported as a message and exit 2."""
+
+
+CHUNK = 1 << 16
+
+
+def open_source(name):
+    """A text stream for `-` (or stdin) or a named file. Decoded leniently, because a log that is not
+    valid UTF-8 must not raise halfway through a pipe and lose the redaction already done; with
+    newline translation off, because the default text mode turns \r\n into \n and blot would
+    otherwise rewrite a Windows-authored file's line endings while claiming only to have redacted
+    it."""
+    if name == "-":
+        raw = getattr(sys.stdin, "buffer", None)
+        if raw is None:
+            return sys.stdin
+        return io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="")
+    return open(name, encoding="utf-8", errors="replace", newline="")
+
+
+def iter_input(files):
+    """Yield lines one at a time: memory holds the current line and the report's accumulators, not
+    the log. The splitting matches a whole-file `text.split("\n")` exactly — a source ending in a
+    newline yields a final empty line, an empty source yields one empty line — because that trailing
+    element is what decides whether the output gets a newline of its own."""
     for name in files or ["-"]:
         try:
-            if name == "-":
-                # Logs are routinely not valid UTF-8. Decoding strictly would raise halfway through a
-                # pipe and lose the redaction that was already done, so bytes come in and undecodable
-                # ones become U+FFFD, exactly as they do for a named file.
-                raw = getattr(sys.stdin, "buffer", None)
-                text = raw.read().decode("utf-8", "replace") if raw else sys.stdin.read()
-            else:
-                # newline="" keeps CRLF intact. Python's default text mode translates it to LF on
-                # read, so blotting a Windows-authored file quietly rewrote every line ending in it —
-                # which is a diff the reader did not ask for.
-                with open(name, encoding="utf-8", errors="replace", newline="") as fh:
-                    text = fh.read()
+            src = open_source(name)
         except OSError as exc:
-            return None, "%s: %s" % (name, getattr(exc, "strerror", None) or exc)
-        if "\x00" in text:
-            return None, ("%s: contains a NUL byte — that is a binary, not text you were about to "
-                          "paste. Refusing rather than writing it out redacted." % name)
-        lines.extend(text.split("\n"))
-    return lines, None
+            raise InputError("%s: %s" % (name, getattr(exc, "strerror", None) or exc))
+        with src:
+            buf = ""
+            while True:
+                try:
+                    chunk = src.read(CHUNK)
+                except OSError as exc:
+                    raise InputError("%s: %s" % (name, getattr(exc, "strerror", None) or exc))
+                if not chunk:
+                    yield buf
+                    break   # this source is done; the next one in `blot a.txt -` still has to run
+                if "\x00" in chunk:
+                    raise InputError("%s: contains a NUL byte — that is a binary, not text you were "
+                                     "about to paste." % name)
+                head = (buf + chunk).split("\n")
+                for line in head[:-1]:
+                    yield line
+                buf = head[-1]
 
 
-def emit(payload, dest):
-    """Write the redacted text, reporting a write failure instead of dumping a stack on it.
-    Returns None on success, or a message for the caller to print and exit non-zero on."""
+def preflight(files):
+    """Fail before a single byte is written if a named source cannot be opened. Reading the whole
+    input up front used to give this for free; streaming has to ask."""
+    for name in files:
+        if name == "-":
+            continue
+        try:
+            os.stat(name)
+        except OSError as exc:
+            return "%s: %s" % (name, getattr(exc, "strerror", None) or exc)
+    return None
+
+
+class _Discard:
+    def write(self, _s):
+        pass
+
+    def flush(self):
+        pass
+
+
+def redact_stream(blotter, files, dest, check=None, discard=False):
+    """Redact `files` into `dest` (stdout if none) line by line, verifying each produced line against
+    `check` as it appears. Returns (bad_lines, error)."""
+    bad, last, handle = [], "", None
     try:
-        if dest:
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(payload)
+        if discard:
+            sink = _Discard()
+        elif dest:
+            handle = open(dest, "w", encoding="utf-8", newline="")
+            sink = handle
         else:
-            sys.stdout.write(payload)
-            sys.stdout.flush()
+            sink = sys.stdout
+        first = True
+        for raw in iter_input(files):
+            text, _hits = blotter.blot_line(raw.rstrip("\n"))
+            if not first:
+                sink.write("\n")
+            sink.write(text)
+            first, last = False, text
+            if check is not None and text:
+                if ((check.blot_line(text)[1] and not LABEL_INNER.search(text))
+                        or LABEL_TAIL.search(text)):
+                    bad.append(blotter._lineno)
+        if last:
+            sink.write("\n")
+        sink.flush()
     except BrokenPipeError:
         # `blot big.log | head -5` is a normal way to use this. Detach stdout so the interpreter's
         # shutdown flush doesn't turn a clean run into a stack trace.
@@ -647,9 +703,26 @@ def emit(payload, dest):
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         except (OSError, ValueError):
             pass
-    except (OSError, ValueError) as exc:
-        return "%s: %s" % (dest or "stdout", getattr(exc, "strerror", None) or exc)
-    return None
+    except InputError as exc:
+        if handle:
+            handle.close()
+            handle = None
+            # A truncated redaction is worse than no output at all: it looks like a finished one,
+            # and the line that stopped it may be the secret.
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+        return bad, str(exc)
+    except OSError as exc:
+        return bad, "%s: %s" % (dest or "stdout", getattr(exc, "strerror", None) or exc)
+    finally:
+        if handle:
+            try:
+                handle.close()
+            except OSError:
+                pass
+    return bad, None
 
 
 def main(argv=None):
@@ -736,19 +809,20 @@ def main(argv=None):
 
     b = Blotter(stable=a.stable, keep=[k.upper() for k in a.keep], pii=a.pii,
                 paranoid=a.paranoid, rules=custom, candidates=a.candidates or a.json or a.strict)
-    src, err = read_input(a.files)
+    err = preflight(a.files)
     if err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return 2
 
-    out_lines = list(b.stream_lines(src))
-    text = "\n".join(out_lines)
-    payload = (text if text.endswith("\n") or not text else text + "\n")
-    if a.out or not a.json:
-        err = emit(payload, a.out)
-        if err:
-            sys.stderr.write("%s: %s\n" % (PROG, err))
-            return 2
+    # verify deliberately ignores --keep: auditing a redaction against the same exceptions that
+    # produced it is how a leak gets certified clean. It does honour --rules, because a detector
+    # someone added on purpose is part of what "recognisable" now means. It runs as each line is
+    # produced, so nothing is held in memory to be re-scanned later.
+    check = Blotter(pii=a.pii, paranoid=a.paranoid, rules=custom) if a.verify else None
+    live, err = redact_stream(b, a.files, a.out, check, discard=a.json and not a.out)
+    if err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return 2
 
     if not a.quiet:
         kinds = " ".join("%s=%d" % (k, v) for k, v in sorted(b.counts.items()))
@@ -796,18 +870,6 @@ def main(argv=None):
             json.dump(b.labels, fh, indent=1, sort_keys=True)
         sys.stderr.write("%s: reverse map -> %s (0600). Publish that file and you have published "
                          "every secret in here.\n" % (PROG, a.mapfile))
-
-    live = []
-    if a.verify:
-        # verify deliberately ignores --keep: auditing a redaction against the same exceptions
-        # that produced it is how a leak gets certified clean. It does honour --rules, because a
-        # detector someone added on purpose is part of what "recognisable" now means.
-        check = Blotter(pii=a.pii, paranoid=a.paranoid, rules=custom)
-        for i, line in enumerate(out_lines, 1):
-            if line and check.blot_line(line)[1] and not LABEL_INNER.search(line):
-                live.append(i)
-            elif line and LABEL_TAIL.search(line):
-                live.append(i)
 
     if a.json:
         print(json.dumps({"version": VERSION, "inputs": a.files or ["-"], "lines": b._lineno,
