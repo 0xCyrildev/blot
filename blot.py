@@ -490,10 +490,16 @@ def read_input(files):
                 raw = getattr(sys.stdin, "buffer", None)
                 text = raw.read().decode("utf-8", "replace") if raw else sys.stdin.read()
             else:
-                with open(name, encoding="utf-8", errors="replace") as fh:
+                # newline="" keeps CRLF intact. Python's default text mode translates it to LF on
+                # read, so blotting a Windows-authored file quietly rewrote every line ending in it —
+                # which is a diff the reader did not ask for.
+                with open(name, encoding="utf-8", errors="replace", newline="") as fh:
                     text = fh.read()
         except OSError as exc:
             return None, "%s: %s" % (name, getattr(exc, "strerror", None) or exc)
+        if "\x00" in text:
+            return None, ("%s: contains a NUL byte — that is a binary, not text you were about to "
+                          "paste. Refusing rather than writing it out redacted." % name)
         lines.extend(text.split("\n"))
     return lines, None
 

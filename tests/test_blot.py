@@ -389,6 +389,33 @@ class TestInputAndErrors(unittest.TestCase):
         self.assertEqual(rc, 130, err)
 
 
+    def test_crlf_line_endings_survive_the_round_trip(self):
+        path = os.path.join(HERE, "_crlf.txt")
+        with open(path, "w", newline="") as fh:
+            fh.write("password=hunter2secretvalue\r\ntoken=ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5\r\n")
+        try:
+            p = subprocess.run([sys.executable, CLI, path], capture_output=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            # bytes, not text=True: universal newlines in the *parent* would translate \r\n away and
+            # the assertion would pass or fail on the harness rather than on blot.
+            self.assertIn(b"\r\n", p.stdout, "blot rewrote the file's line endings")
+            self.assertNotIn(b"hunter2secretvalue", p.stdout)
+        finally:
+            os.remove(path)
+
+    def test_a_binary_is_refused_rather_than_written_out(self):
+        path = os.path.join(HERE, "_bin.dat")
+        with open(path, "wb") as fh:
+            fh.write(b"\x7fELF\x00\x00password=hunter2secretvalue\x00")
+        try:
+            rc, out, err = run(path)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("NUL", err)
+            self.assertEqual(out, "", "binary content reached stdout")
+        finally:
+            os.remove(path)
+
+
 class TestEntropyGate(unittest.TestCase):
     SHA = "4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8"
     OTHER = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
