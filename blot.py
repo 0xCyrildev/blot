@@ -40,6 +40,26 @@ RULES = [
     ("GOOGLEKEY", re.compile(r"\b(?P<sec>AIza[0-9A-Za-z_\-]{30,40})\b"), ("aiza",)),
     ("SLACK", re.compile(r"\b(?P<sec>xox[baprs]-[0-9A-Za-z-]{10,})\b"),
      ("xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-")),
+    ("SLACKWEBHOOK", re.compile(
+        r"(?P<sec>https://hooks\.slack\.com/(?:services|wf/[TS])/[A-Za-z0-9/_\-]{8,})"),
+     ("hooks.slack.com",)),
+    ("DISCORDHOOK", re.compile(
+        r"(?i)(?P<sec>https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/"
+        r"\d{15,21}/[A-Za-z0-9_\-]{24,})"), ("/api/webhooks/",)),
+    ("GITLAB", re.compile(r"\b(?P<sec>glpat-[A-Za-z0-9_\-]{20}(?:_\d{8})?)\b"), ("glpat-",)),
+    ("NPM", re.compile(r"\b(?P<sec>npm_[A-Za-z0-9]{36})\b"), ("npm_",)),
+    ("PYPI", re.compile(r"\b(?P<sec>pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{20,})"), ("pypi-agei",)),
+    ("HUGGINGFACE", re.compile(r"\b(?P<sec>hf_[A-Za-z0-9]{34,})\b"), ("hf_",)),
+    ("CLOUDFLARE", re.compile(r"\b(?P<sec>cfut_[A-Za-z0-9_\-]{20,})\b"), ("cfut_",)),
+    ("GRAFANA", re.compile(r"\b(?P<sec>gl(?:sa|da|c|dc)_[A-Za-z0-9=_\-]{20,})\b"),
+     ("glsa_", "glda_", "glc_", "gldc_")),
+    ("SENTRY", re.compile(r"\b(?P<sec>sntrys_[A-Za-z0-9_\-]{40,})\b"), ("sntrys_",)),
+    ("SENDGRID", re.compile(
+        r"\b(?P<sec>SG\.[A-Za-z0-9_\-]{16,32}\.[A-Za-z0-9_\-]{16,64})\b"), ("sg.",)),
+    ("STRIPEWH", re.compile(r"\b(?P<sec>whsec_[A-Za-z0-9]{16,})\b"), ("whsec_",)),
+    ("GOOAUTH", re.compile(r"\b(?P<sec>ya29\.[A-Za-z0-9_\-]{25,})"), ("ya29.",)),
+    ("TWILIOSID", re.compile(
+        r"(?i)(?P<keep>\baccount[_-]?sid\s*[:=]\s*)(?P<sec>(?:AC|SK)[0-9a-f]{32})\b"), ("sid",)),
     ("STRIPE", re.compile(r"\b(?P<sec>(?:sk|pk|rk)_(?:live|test)_[0-9A-Za-z]{10,})\b"),
      ("sk_live_", "sk_test_", "pk_live_", "pk_test_", "rk_live_", "rk_test_")),
     ("LLMTOKEN", re.compile(r"\b(?P<sec>sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,})\b"), ("sk-",)),

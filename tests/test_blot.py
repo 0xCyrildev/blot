@@ -189,6 +189,33 @@ class TestKeyNames(unittest.TestCase):
         self.assertIn("<ENTROPY", out)
 
 
+    def test_the_vendor_wave_is_labelled_by_vendor(self):
+        for typ, line in [
+            ("GITLAB", "x=glpat-" + "a" * 20),
+            ("NPM", "x=npm_" + "b" * 36),
+            ("PYPI", "x=pypi-AgEIcHlwaS5vcmc" + "c" * 40),
+            ("HUGGINGFACE", "x=hf_" + "d" * 34),
+            ("CLOUDFLARE", "x=cfut_" + "e" * 40),
+            ("GRAFANA", "x=glsa_" + "f" * 30),
+            ("GRAFANA", "x=gldc_" + "f" * 30),
+            ("SENTRY", "x=sntrys_" + "g" * 48),
+            ("SENDGRID", "x=SG." + "h" * 20 + "." + "i" * 40),
+            ("STRIPEWH", "x=whsec_" + "j" * 24),
+            ("GOOAUTH", "x=ya29." + "k" * 40),
+            ("TWILIOSID", "account_sid=AC" + "0123456789abcdef" * 2),
+            ("SLACKWEBHOOK", "https://hooks.slack.com/services/T000/B000/" + "Z" * 24),
+            ("DISCORDHOOK", "https://discord.com/api/webhooks/123456789012345678/" + "Y" * 30),
+        ]:
+            out, hits = blot.Blotter().blot_line(line)
+            self.assertTrue(hits, "%s not blotted: %s" % (typ, line))
+            self.assertIn("<%s:" % typ, out, "%s mislabelled: %s" % (typ, out))
+
+    def test_the_name_stays_visible_when_only_the_value_is_a_credential(self):
+        b = blot.Blotter()
+        out, _ = b.blot_line("account_sid=AC" + "0123456789abcdef" * 2)
+        self.assertIn("account_sid=", out, "a reader must still know which field this was")
+
+
 class TestScreens(unittest.TestCase):
     """Each rule carries a screen: literals that ANY match must contain. That is a claim about the
     regex, and getting it backwards silently loses secrets. So: run the whole corpus with screens on
@@ -216,6 +243,14 @@ class TestScreens(unittest.TestCase):
         cases.append("Authorization: Bearer abcdefghijklmnop")
         cases.append("basic U2VjcmV0VmFsdWU=")
         cases.append("Cookie: session=abcdefghijklmnop")
+        for v in ("glpat-" + "a" * 20, "npm_" + "b" * 36, "pypi-AgEIcHlwaS5vcmc" + "c" * 40,
+                  "hf_" + "d" * 34, "cfut_" + "e" * 40, "glsa_" + "f" * 30, "gldc_" + "f" * 30,
+                  "sntrys_" + "g" * 48, "SG." + "h" * 20 + "." + "i" * 40, "whsec_" + "j" * 24,
+                  "ya29." + "k" * 40, "AC" + "0123456789abcdef" * 2,
+                  "https://hooks.slack.com/services/T000/B000/" + "Z" * 24,
+                  "https://discord.com/api/webhooks/123456789012345678/" + "Y" * 30):
+            cases.append("account_sid=" + v)
+            cases.append("x=" + v)
         for n in ("password", "passwd", "pass", "pwd", "secret", "secret_key", "secret_key_base",
                   "api_key", "apikey", "app_key", "master_key", "encryption_key", "signing_key",
                   "access_key", "access_key_id", "access_token", "private_key", "auth_token",
