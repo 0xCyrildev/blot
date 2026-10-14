@@ -31,6 +31,7 @@ One file, stdlib only, no network, no config, no telemetry. It has never heard o
 cargo build --verbose 2>&1 | blot > safe-log.txt        # the common case
 blot draft.md --out draft.published.md --map draft.map.json
 cat transcript.txt | blot --verify > /dev/null          # exits 3 rather than claiming a clean
+blot app.env --rules learned.json --strict              # exits 4 until every shape has a rule
 blot --pii --paranoid build.log                         # emails/IPs, plus high-entropy strays
 ```
 
@@ -60,32 +61,47 @@ the playbook for driving it from an agent — symlink it into `~/.qoder/skills` 
 
 ![the loop](docs/img/candidates.png)
 
-## It checks its own work
+## Two gates, not one
 
 `--verify` re-scans the text blot produced and refuses to call it clean if anything recognisable is
 still live. It deliberately ignores `--keep`: auditing a redaction against the same exceptions that
 produced it is how a leak gets certified clean.
 
+`--strict` adds the second gate — the candidate sweep has to come back empty too. That is the
+difference between *nothing recognised survived* and *nothing recognisable survived*, and it is the
+difference an agent can act on: 4 names the shapes, `--rules` teaches them, 0 means both gates passed.
+
+| exit | meaning |
+|---|---|
+| 0 | clean — both gates passed |
+| 2 | usage or I/O failure; nothing was written |
+| 3 | a recognised secret is still live, with line numbers |
+| 4 | nothing recognised survived, but an unnamed shape did |
+
 ![verify refusing](docs/img/verify.png)
 
 ## Limits, honestly
 
-- **Detection is by shape and by name.** A secret in a format blot does not know passes through —
-  that is what `--candidates` is for. `--verify` uses the same eyes, so it proves *nothing recognised
-  survived*, not *nothing survived*.
-- **Over-redaction is also a failure.** That is why the key-name list is curated rather than
-  `.*key.*=`, and why a git sha next to the word `commit` is left alone. `--paranoid` trades
-  precision for reach when you would rather lose the line than lose the token.
-- **A rule you supply is a regex you run.** blot compiles `--rules` as written and does not defend
-  against a pathological one; it refuses a rule that could not work.
-- **`--map` is the only copy** of the label-to-secret table, created 0600 and never overwritten.
-  Publish that file and you have published everything.
+No longer limits: an unknown shape can be found (`--candidates`), refused (`--strict`) and learned
+(`--rules`); a pathological rule is probed against short adversarial inputs and rejected before it can
+hang the run; the reverse map refuses to land inside a git work tree; and a 111 MB log costs 27 MB of
+memory, because lines are streamed through rather than collected and joined.
+
+What is still true:
+
+- **A secret that is unnamed, unstructured and low-entropy is invisible.** `--candidates` is what
+  catches the next `footprint=`; nothing catches a value that looks exactly like the text around it.
+- **Over-redaction is a failure too,** and the answer is a trade rather than a solution: the key-name
+  list is curated rather than `.*key.*=`, a git sha beside `commit` stays put, and `--paranoid` buys
+  reach with precision when you would rather lose the line than lose the token.
+- **`--map` is the only copy** of the label-to-secret table — 0600, never silently overwritten.
+  Publish it and you have published everything.
 - Not a DLP, not a compliance scanner, not a substitute for rotating what you leaked.
 
 ## Develop
 
 ```sh
-python3 tests/test_blot.py    # 48 tests, stdlib only, no install step
+python3 tests/test_blot.py    # 65 tests, stdlib only, no install step
 ```
 
 MIT. If blot cost you a credential, the failure was the credential being there — but do open an

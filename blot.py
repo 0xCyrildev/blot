@@ -19,7 +19,11 @@ whole loop be driven by an agent that is never shown a secret. `--dump-rules FIL
 built-in set instead of from nothing.
 
   blot app.log --json --candidates --out app.safe.txt   # an agent reads the report, not the log
-  blot app.log --rules learned.json --verify            # ...and blot applies what it decided
+  blot app.log --rules learned.json --strict            # ...and blot applies what it decided
+
+Exit codes: 0 clean · 2 usage or I/O failure, nothing written · 3 a recognised secret is still live ·
+4 refused by --strict, because nothing recognised survived but an unnamed shape did. Lines are
+streamed, so memory tracks how many secrets a run found rather than how large the input was.
 """
 import argparse
 import hashlib
@@ -33,7 +37,7 @@ import sys
 import time
 
 PROG = os.path.basename(sys.argv[0]).split(".")[0]
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # Named groups: `keep` is the context that stays visible (so a reader can still tell WHICH field was
 # blotted), `sec` is the secret, `q`/`tail` preserve quoting. Order matters: specific prefixed forms

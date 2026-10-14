@@ -45,14 +45,17 @@ raw value, that is the signal to write a broader rule, not to look.
    line — a screen that is wrong silently un-does the rule, so if you are unsure, omit it.
    `blot --dump-rules built.json` gives you the built-in set to copy a shape from.
    `blot in.log --rules rules.json --candidates --json --out in.safe.txt`
-4. **Gate.** `blot in.log --rules rules.json --out in.safe.txt --verify` must exit **0**. Exit **3**
-   means something recognisable is still live, and it names the lines. `--verify` ignores `--keep` on
-   purpose: never let the exceptions that produced a redaction certify it.
+4. **Gate.** `blot in.log --rules rules.json --out in.safe.txt --strict` must exit **0**. `--strict`
+   runs `--verify` and then refuses with **4** if any unnamed shape is still standing — which is how
+   you learn your rule set is incomplete without publishing the log to find out. Exit **3** means a
+   recognised secret survived, and it names the lines. `--verify` ignores `--keep` on purpose: never
+   let the exceptions that produced a redaction certify it.
 
 ## Exit codes
 
-`0` clean · `2` usage or I/O failure (nothing was written) · `3` **not clean**, output still holds a
-recognisable secret.
+`0` clean · `2` usage or I/O failure (nothing was written) · `3` **not clean**, a recognised secret is
+still live · `4` **unnamed** — nothing recognised survived, but a candidate shape did, so go back to
+step 3.
 
 ## Flags worth reaching for
 
