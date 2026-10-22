@@ -325,6 +325,53 @@ class TestPemOneLine(unittest.TestCase):
         self.assertIn("after the block", out, "the run swallowed the line after a closed block")
 
 
+class TestPgpBlocks(unittest.TestCase):
+    """PGP's ASCII armor writes `-----BEGIN PGP PRIVATE KEY BLOCK-----`. The `[A-Z ]*PRIVATE KEY`
+    in the markers could not reach past the space before BLOCK, so a private key in the most common
+    export format on the planet was passed through untouched."""
+
+    PGP = ("-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+           "Version: GnuPG v2\n"
+           "Comment: AARgBV0DCADg9o0HkPu0M8oGBACMRm9jYW6lCgYEAo0=\n"
+           "mQINBGVk7XgB/adRgK8pn0fqbGFr3V9u4TQ1Ck4w1jZ0Fg0Kk7w=\n"
+           "=Xk3L\n"
+           "-----END PGP PRIVATE KEY BLOCK-----")
+
+    def test_a_pgp_private_key_block_becomes_one_label(self):
+        b = blot.Blotter()
+        outs = [b.blot_line(l) for l in self.PGP.split("\n")]
+        labels = [o for o, _ in outs if o]
+        self.assertEqual(len(labels), 1, outs)
+        self.assertIn("<PRIVKEY:", labels[0])
+        joined = "\n".join(o for o, _ in outs)
+        for body in ("mQINBGVk7XgB", "adRgK8pn0fqbGFr3V9u4TQ1Ck4w", "=Xk3L"):
+            self.assertNotIn(body, joined, "%s survived: %s" % (body, joined))
+
+    def test_a_pgp_block_that_shares_one_line_is_blotted_too(self):
+        line = ('{"secret": "-----BEGIN PGP PRIVATE KEY BLOCK-----\\nVersion: h\\nmQINBGVk7XgB\\n'
+                '-----END PGP PRIVATE KEY BLOCK-----\\n"}')
+        out, hits = blot.Blotter().blot_line(line)
+        self.assertTrue(hits)
+        self.assertNotIn("mQINBGVk7XgB", out, out)
+        self.assertNotIn("-----END", out, out)
+
+    def test_the_line_after_a_pgp_block_survives(self):
+        b = blot.Blotter()
+        for l in self.PGP.split("\n"):
+            b.blot_line(l)
+        self.assertEqual(b.blot_line("the next log line")[0], "the next log line")
+
+    def test_a_public_key_block_is_not_a_secret(self):
+        # Over-redaction is a failure too: a PUBLIC KEY BLOCK is public by name, and blotting it
+        # would take the fingerprint a reader needs out of the report.
+        line = ("-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+                "mQINBGVk7XgB/QFx0hv3kZ1sCgYEAo8uI1n3Q4tLpZ7w=\n"
+                "-----END PGP PUBLIC KEY BLOCK-----")
+        b = blot.Blotter()
+        outs = [b.blot_line(l) for l in line.split("\n")]
+        self.assertEqual([o for o, _ in outs], line.split("\n"), outs)
+
+
 class TestKeyNames(unittest.TestCase):
     """KV is a curated list of names, so the list has to cover the names people actually leak.
     Over-matching is a failure too, so both directions get asserted."""

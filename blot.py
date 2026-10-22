@@ -141,8 +141,12 @@ PII = (("EMAIL", re.compile(r"\b(?P<sec>[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+)\b"), ("
        ("IPV4", re.compile(r"\b(?P<sec>(?:\d{1,3}\.){3}\d{1,3})\b"), (".",)),
        ("PHONE", re.compile(r"\b(?P<sec>\+?\d[\d\s\-()]{8,14}\d)\b"), ()))
 
-PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
-PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+# ` BLOCK` is load-bearing, not decoration: PGP's ASCII armor writes `-----BEGIN PGP PRIVATE KEY
+# BLOCK-----` and `[A-Z ]*PRIVATE KEY` cannot reach past the space before it, so the single most
+# common private-key export format passed straight through. PUBLIC KEY blocks stay unmatched on
+# purpose — a public key is not a secret, and blotting one removes the fingerprint a reader needs.
+PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----")
+PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----")
 
 # A wallet seed is a run of plain dictionary words. Counting words alone would blot half of poetry,
 # so the run must also contain at least two words from a curated BIP39 subset.
