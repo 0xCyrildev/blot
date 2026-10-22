@@ -137,9 +137,9 @@ RULES = [
      ("pass", "pwd", "secret", "key", "token", "seed", "mnemonic", "recovery", "phrase", "otp")),
 ]
 
-PII = (("EMAIL", re.compile(r"\b[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+\b"), ("@",)),
-       ("IPV4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), (".",)),
-       ("PHONE", re.compile(r"\b(?:\+?\d[\d\s\-()]{8,14}\d)\b"), ()))
+PII = (("EMAIL", re.compile(r"\b(?P<sec>[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+)\b"), ("@",)),
+       ("IPV4", re.compile(r"\b(?P<sec>(?:\d{1,3}\.){3}\d{1,3})\b"), (".",)),
+       ("PHONE", re.compile(r"\b(?P<sec>\+?\d[\d\s\-()]{8,14}\d)\b"), ()))
 
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
@@ -171,17 +171,35 @@ PARANOID_MIN_BITS = 3.0
 # --json lists every blot, which on a log where every line carries a secret would otherwise grow
 # without bound. Past this the report says so rather than lying by omission.
 MAX_FINDINGS = 20000
-# A placeholder, tolerant of being cut off mid-label, because a later rule can match inside one.
-# The type name has to allow what --rules allows: an earlier version matched only <[A-Z]+:, so the
-# placeholder left by a rule named INTERNAL_KEY was not recognised as a placeholder and got blotted
-# a second time, corrupting the one token that points back to the secret.
-LABEL_INNER = re.compile(r"<[A-Z][A-Z0-9_]*(?::[^>\s]*)?>?", re.I)
 # A label with 16+ credential-shaped characters still glued to it: `<JWT:1>eyJhbGciOiJI...` is what a
 # half-redacted secret looks like, and verify must not be fooled by the label in front of it.
 LABEL_TAIL = re.compile(r"<[A-Z][A-Z0-9_]*:[^>]*>[^\s<]*[A-Za-z0-9_/+\-]{16,}")
 
 
 ALL_TYPES = {t for t, _, _ in RULES} | {t for t, _, _ in PII} | {"PRIVKEY", "SEEDPHRASE", "ENTROPY"}
+# The types that can appear *inside a label*, which is not the same set as the rule names: URLCREDS
+# is the rule, `URLCREDENTIALS` is what gets printed. A guard built from rule names alone would not
+# recognise the label that rule leaves behind and would blot inside it.
+LABEL_TYPES = ALL_TYPES | {"URLCREDENTIALS"}
+
+
+def label_pattern(types):
+    """Recognise a placeholder, and only a placeholder.
+
+    The guard this builds is what stops a later, more generic rule from re-blotting text an earlier
+    rule already replaced — so its false-positive cost is a secret that survives, and it used to pay
+    it: matched case-insensitively with an optional `>`, `<ss` inside `password=pa<ss1word99` looked
+    like a label and shielded the secret. Type names come from the set this tool can actually emit,
+    compared case-sensitively, and the tag must be followed by a colon. The closing `>` stays
+    optional: a rule whose character class stops at `>` can match a truncated label, and one that
+    then re-blots it corrupts the only token pointing back to the secret.
+
+    The set has to include what --rules adds. An earlier version matched only `<[A-Z]+:`, so the
+    placeholder left by a rule named INTERNAL_KEY was not recognised as a placeholder and got blotted
+    a second time."""
+    alt = "|".join(sorted((re.escape(t) for t in types), key=lambda s: (-len(s), s)))
+    return re.compile(r"<(?:%s):[A-Za-z0-9]*>?" % alt)
+
 
 # --- candidate sweep -----------------------------------------------------------------------------
 # What an agent looks at: everything that survived redaction and still *shaped* like a secret. The
@@ -307,6 +325,9 @@ class Blotter:
         # A custom rule may arrive with no screen, and then the union-of-screens shortcut is not
         # sound for it, so the shortcut is only built when every active rule screens for something.
         self._prefilter = SCREEN_ANY if all(sc for _t, _rx, sc in self.rules) else None
+        # The placeholder guard has to know the labels *this* run can emit, --rules names included,
+        # or a generic rule re-blots inside a label a custom one left behind.
+        self.label_re = label_pattern(LABEL_TYPES | {t for t, _, _ in self.rules})
         self.labels = {}
         self.counts = {}
         self.cands = {}
@@ -341,7 +362,7 @@ class Blotter:
             # A later, more generic rule must not eat a placeholder an earlier one left behind:
             # `password: 1>` inside `<PASSWORD:1>` is not a credential, and re-blotting it corrupts
             # the label that is the report's only reference back to the secret.
-            if LABEL_INNER.search(m.group(0)):
+            if self.label_re.search(m.group(0)):
                 return m.group(0)
             hits[0] += 1
             gd = m.groupdict()
@@ -441,7 +462,7 @@ class Blotter:
         taken = []
 
         def note(kind, site, tok, span=None):
-            if LABEL_INNER.search(tok):
+            if self.label_re.search(tok):
                 return
             if span and any(t[0] <= span[0] and span[1] <= t[1] for t in taken):
                 return
@@ -512,7 +533,7 @@ class Blotter:
             if bare_hex and BENIGN_CONTEXT.search(near(out, m.start("sec"), m.end("sec"))):
                 pos = m.end("sec")
                 continue
-            if entropy(sec) >= PARANOID_MIN_BITS and not LABEL_INNER.search(sec):
+            if entropy(sec) >= PARANOID_MIN_BITS and not self.label_re.search(sec):
                 lab = self.label("ENTROPY", sec)
                 self._note("ENTROPY", lab)
                 out = out[:m.start("sec")] + lab + out[m.end("sec"):]

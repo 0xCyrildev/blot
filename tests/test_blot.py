@@ -199,6 +199,87 @@ class TestVerifyLineGranularity(unittest.TestCase):
         self.assertNotIn("hunter22", out)
 
 
+class TestLabelGuard(unittest.TestCase):
+    """The guard that stops a rule blotting inside a placeholder has to know what a placeholder is.
+    Tolerant and case-insensitive, `<ss` in `pa<ss1word99` counted as one and shielded the secret."""
+
+    def test_an_angle_bracket_that_is_not_a_label_does_not_shield_a_secret(self):
+        out, hits = blot.Blotter().blot_line("password=pa<ss1word99")
+        self.assertTrue(hits, "the guard read `<ss` as a placeholder and skipped the line")
+        self.assertNotIn("pa<ss1word99", out, out)
+
+    def test_a_secret_in_a_case_is_not_shielded_by_a_pseudo_label(self):
+        for line in ["secret=<x><JWT-ish>hunter2secret", "token=<low>abcdefghij0123456789"]:
+            out, hits = blot.Blotter().blot_line(line)
+            self.assertTrue(hits, "not blotted: " + line)
+            self.assertNotIn("hunter2secret", out, out)
+
+    def test_a_real_label_still_shields_itself_from_later_rules(self):
+        b = blot.Blotter()
+        once, _ = b.blot_line("api_key=abcdefghijkl1234")
+        self.assertIn("<", once)
+        self.assertEqual(b.blot_line(once)[0], once, "a placeholder was blotted a second time")
+
+    def test_the_repro_line_is_redacted_and_still_verifies_clean(self):
+        rc, out, err = run("--quiet", "--verify", stdin="password=pa<ss1word99\n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("pa<ss1word99", out, out)
+
+    def test_the_guard_accepts_truncated_labels_and_nothing_else(self):
+        b = blot.Blotter()
+        self.assertIsNotNone(b.label_re.search("<KV:1"), "a rule whose class stops at `>` can "
+                             "match the label without its closing bracket")
+        self.assertIsNone(b.label_re.search("pa<ss1word99"), "an ordinary `<` is not a label")
+        self.assertIsNone(b.label_re.search("<jwt:1>"), "blot never emits a lowercase label")
+        self.assertIsNotNone(b.label_re.search("<URLCREDENTIALS:12>"),
+                             "the one label whose type is not a rule name")
+
+    def test_every_label_blot_emits_is_matched_by_blots_own_guard(self):
+        # URLCREDS emits <URLCREDENTIALS:n>, which is not the name of any rule: a guard built from
+        # rule names alone would re-blot inside it and corrupt the one token pointing at the secret.
+        samples = TestScreens.corpus() + [
+            PEM, "wallet: " + SEED, "cipher=" + "0a1b2c3d4e5f60718293a4b5c6d7e8f90123a4b5",
+            "postgres://deploy:Sup3rS3cret@db.internal:5432/app", "user@example.com",
+            "x=4111 1111 1111 1111",
+        ]
+        b = blot.Blotter(pii=True, paranoid=True, rules=[("MY_INTERNAL_KEY",
+                                                         re.compile(r"(?P<sec>none)"), ())])
+        for line in samples:
+            for sub in line.split("\n"):
+                out = b.blot_line(sub)[0]
+                for lab in re.findall(r"<[A-Za-z_][A-Za-z0-9_]*:[^>\s]*>", out):
+                    self.assertIsNotNone(b.label_re.fullmatch(lab),
+                                         "%s emitted in %r but the guard does not know it"
+                                         % (lab, out))
+
+
+class TestPII(unittest.TestCase):
+    """`--pii` was advertised, listed in --list-types, and unreachable: none of the three PII patterns
+    named a `sec` group, so the first email on a line raised IndexError out of main(). load_rules has
+    refused a --rules regex without one all along; the built-ins are held to the same contract here."""
+
+    def test_every_built_in_pattern_names_the_group_it_replaces(self):
+        for name, rx, _screen in list(blot.RULES) + list(blot.PII):
+            self.assertIn("sec", rx.groupindex, "%s cannot be replaced: no (?P<sec>...) group" % name)
+
+    def test_pii_blots_instead_of_raising(self):
+        for line, secret in [("contact user@example.com for details", "user@example.com"),
+                             ("client 203.0.113.77 connected", "203.0.113.77"),
+                             ("call +1 555 987 6543 back", "555 987 6543")]:
+            out, hits = blot.Blotter(pii=True).blot_line(line)
+            self.assertTrue(hits, "not blotted: " + line)
+            self.assertNotIn(secret, out, out)
+
+    def test_pii_is_off_unless_asked_for(self):
+        line = "contact user@example.com for details"
+        self.assertEqual(blot.Blotter().blot_line(line)[0], line)
+
+    def test_the_pii_flag_survives_the_cli(self):
+        rc, out, err = run("--pii", "--quiet", stdin="contact user@example.com\n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("user@example.com", out, out)
+
+
 class TestKeyNames(unittest.TestCase):
     """KV is a curated list of names, so the list has to cover the names people actually leak.
     Over-matching is a failure too, so both directions get asserted."""
