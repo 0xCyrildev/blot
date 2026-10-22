@@ -49,6 +49,41 @@ VERSION = "1.2.0"
 # wrong in that direction silently loses secrets, which is the one failure this tool cannot have. The
 # regexes are long alternations and cost ~40x what a substring test costs on a line that cannot match
 # (KV alone was 8.5s of an 18s run over a 12 MB log). An empty tuple means "always run it".
+# Base58 (Bitcoin/Solana): alphanumerics minus the four characters that read alike — no 0, O, I, l.
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+# Bech32's data part: a 32-character alphabet, and `suiprivkey1` is a bech32 string's HRPs + `1`.
+BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+def _ci(word):
+    """A case-insensitive literal written out, without the (?i) flag.
+
+    Case folding is not local to the token: `(?<![a-z0-9])` and `(?=[A-Z])` mean different things
+    folded and unfolded, and with (?i) set, `(?:[a-z0-9]+(?:[_.-]|(?=[A-Z])))*` — "a name ending in
+    this token" — matched a lowercase run as any number of zero-width-split pieces. On a 64-hex
+    private key that is `(a+)+` and the match never returned. The guard has to stay unfolded, so the
+    literals are spelled out instead."""
+    return "".join("[%s%s]" % (c.lower(), c.upper()) for c in word)
+
+
+# A field name that ENDS in one of these as its own word: the token starts at a word boundary or at a
+# camelCase junction, and nothing but a quote and spacing may follow it before the `:`/`=`. Both halves
+# matter — `monkey=` ends in the letters key and `keyword=` starts with them. KV is deliberately not
+# generalised to this, because `test_paranoid_reaches_the_vendor_names_the_list_cannot_hold` requires
+# the default to stay quiet on `MYVENDOR_KEY=`; the chain rules below pair the name with a value shape
+# narrow enough to be worth a label of its own.
+EVM_TOKENS = ("key", "pk", "private", "signer", "deployer", "mnemonic")
+JSON_TOKENS = ("key", "keypair", "keystore", "secret", "private", "wallet", "mnemonic")
+
+
+def name_site(tokens):
+    return (r"(?:(?<![A-Za-z0-9])|(?<=[a-z])(?=[A-Z]))(?:%s)[\"']?\s*[:=]\s*"
+            % "|".join(_ci(t) for t in tokens))
+
+
+NAME_SITE = name_site(EVM_TOKENS)
+NAME_SITE_JSON = name_site(JSON_TOKENS)
+RPC_FAMILIES = ("etherscan", "bscscan", "polygonscan", "arbiscan", "basescan", "ftmscan", "hecoinfo",
+                "snowtrace")
+
 RULES = [
     ("AWS", re.compile(r"\b(?P<sec>(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANVA|APINA)[0-9A-Z]{12,20})\b"),
      ("akia", "asia", "aida", "aroa", "agpa", "aipa", "anva", "apina")),
@@ -122,6 +157,29 @@ RULES = [
         r"(?P<sec>[A-Za-z0-9._~+/=\-]{16,})"), ("authorization",)),
     ("COOKIE", re.compile(
         r"(?i)(?P<keep>\b(?:cookie|set-cookie)\s*[:=]\s*)(?P<sec>[^\r\n\"']{8,})"), ("cookie",)),
+    # --- chain keys, part 1: the site itself names the service ------------------------------------
+    # Every shape below is something a public object also has, so none of them may fire on shape
+    # alone: `0x`+64 hex is a transaction hash, 87-88 base58 is also a signature, 32-44 base58 is every
+    # address on Solana. What makes a match is either a name nobody gives a public thing, or a length
+    # no public object reaches.
+    ("RPCURL", re.compile(
+        r"(?i)(?P<keep>https?://(?:[a-z0-9\-]+\.)*"
+        r"(?:alchemy\.com/v2/|infura\.io/v3/|quiknode\.pro/(?:[a-z0-9\-]+/)*|"
+        r"ankr\.com/[a-z0-9\-]{2,}/|helius-rpc\.com/\?api-key=))(?P<sec>[A-Za-z0-9_\-]{16,})"),
+     ("alchemy.com/v2/", "infura.io/v3/", "quiknode.pro/", "ankr.com/",
+      "helius-rpc.com/?api-key=")),
+    # The family is in the pattern, not inferred: `?apikey=<31 alnum>` on a host nobody has heard of is
+    # not evidence that Etherscan was leaked. Etherscan and its forks all take the key in the query
+    # string, and the key is mixed-case alphanumerics with no prefix to screen on.
+    ("ETHERSCAN", re.compile(
+        r"(?i)(?P<keep>(?:https?://)?(?:[a-z0-9.\-]*[.\-])?(?:%s)(?:\.[a-z]{2,})?(?:/api)?"
+        r"(?:[\w=?&+.\%%\-]*[&?])?[_.\-]?api[_-]?key\s*[:=]\s*)"
+        r"(?P<sec>[A-Za-z0-9]{24,40})" % "|".join(RPC_FAMILIES)),
+     RPC_FAMILIES),
+    # Sui writes a secret key as a bech32 string: `suiprivkey1` then the 32-character data alphabet.
+    # No boundary guard on purpose — a key concatenated onto other text is still the key, and forcing
+    # a boundary would turn a miss into a leak.
+    ("SUIPRIVKEY", re.compile(r"(?i)(?P<sec>suiprivkey1[%s]{50,})" % BECH32), ("suiprivkey1",)),
     # At a name whose whole job is to hold a phrase, the value does not stop at the first space. KV's
     # `sec` class excludes whitespace, so `mnemonic=witch collapse practice feed ...` blotted `witch`
     # and left the other eleven words of the seed on the page. Three names only — seed, mnemonic,
@@ -147,6 +205,24 @@ RULES = [
         r"webhook[_-]?secret)[\"']?\s*[:=]\s*)(?P<q>[\"']?)(?P<sec>[^\"'\s,;}\]]{5,})"
         r"(?P<tail>(?P=q))"),
      ("pass", "pwd", "secret", "key", "token", "seed", "mnemonic", "recovery", "phrase", "otp")),
+    # --- chain keys, part 2: the shape decides, and these run after KV -----------------------------
+    # After KV on purpose. `API_KEY=0x…` and `PRIVATE_KEY=0x…` are already named secrets, and calling
+    # one of them an EVM private key would be a claim about which chain was leaked that the line does
+    # not support. These three fire on the sites KV's curated list cannot see.
+    ("EVMPRIVKEY", re.compile(
+        r"(?P<keep>" + NAME_SITE + r")(?P<q>[\"']?)(?P<sec>0x[0-9a-fA-F]{64})(?P<tail>(?P=q))"),
+     ("0x",)),
+    # A Solana keypair dumped as JSON is 64 bytes of decimal in brackets — no encoding, no prefix, so
+    # the array is only a keypair because of the name in front of it. 32 entries minimum: fewer than
+    # that is a coordinate, a colour, a page of results.
+    ("SOLKEYJSON", re.compile(
+        r"(?P<keep>" + NAME_SITE_JSON + r")\[\s*(?P<sec>\d{1,3}(?:\s*,\s*\d{1,3}){31,127})\s*\]"),
+     ("key", "secret", "private", "wallet")),
+    # An ed25519 secret key is 64 bytes, which is 87 or 88 base58 characters and has no other marking,
+    # so this is the one built-in with no screen literal — see GATED_NO_SCREEN. A signature is the same
+    # length and is public; blotting it is the deliberate side of that trade, and an address (32-44
+    # characters) is nowhere near this length and stays in the report.
+    ("SOLPRIVKEY", re.compile(r"\b(?P<sec>[%s]{87,88})\b" % BASE58), ()),
 ]
 
 PII = (("EMAIL", re.compile(r"\b(?P<sec>[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+)\b"), ("@",)),
@@ -550,6 +626,13 @@ def near(text, lo, hi, window=CTX_WINDOW):
 # instead of ~70 Python-level substring checks per line, which is what the per-rule screens add up
 # to on a 200k-line log.
 SCREEN_ANY = re.compile("|".join(re.escape(s) for _t, _rx, sc in RULES for s in sc))
+# SOLPRIVKEY is the one built-in that cannot screen: a run of 87-88 base58 characters is the whole
+# evidence, and no literal inside it is necessary. Rather than disable the shortcut for every rule
+# (which costs ~40 regex searches per line, on every line), the union gains a branch that is a
+# necessary condition for exactly that rule. The lookbehind matters: without it, a 40,000-character
+# word would make the engine try 87 characters at every position.
+SOL_BASE58_GATE = re.compile(r"(?<![%s])[%s]{87,88}" % (BASE58, BASE58))
+GATED_NO_SCREEN = {"SOLPRIVKEY"}
 
 
 def entropy(tok):
@@ -647,8 +730,10 @@ class Blotter:
         # generic guess, and the label it produces is the one they will read in the report.
         self.rules = list(rules or []) + RULES
         # A custom rule may arrive with no screen, and then the union-of-screens shortcut is not
-        # sound for it, so the shortcut is only built when every active rule screens for something.
-        self._prefilter = SCREEN_ANY if all(sc for _t, _rx, sc in self.rules) else None
+        # sound for it, so the shortcut is only built when every active rule screens for something —
+        # or is one of the built-ins whose shape the shortcut carries itself.
+        self._prefilter = SCREEN_ANY if all(sc or typ in GATED_NO_SCREEN
+                                            for typ, _rx, sc in self.rules) else None
         # The placeholder guard has to know the labels *this* run can emit, --rules names included,
         # or a generic rule re-blots inside a label a custom one left behind.
         self.label_re = label_pattern(LABEL_TYPES | {t for t, _, _ in self.rules})
@@ -795,7 +880,8 @@ class Blotter:
                 out = out[:a] + lab + out[b:]
                 hits += 1
         low = out.lower()
-        if not self.screen or self._prefilter is None or self._prefilter.search(low):
+        if (not self.screen or self._prefilter is None or self._prefilter.search(low)
+                or SOL_BASE58_GATE.search(out)):
             for typ, rx, screen in self.rules:
                 if typ in self.keep:
                     continue

@@ -562,6 +562,132 @@ class TestSeedPhrase(unittest.TestCase):
         self.assertNotIn("despair", out, out)
 
 
+class TestWeb3(unittest.TestCase):
+    """Chain keys are the reason a lot of these logs exist. They are also the hardest shape to catch
+    honestly: `0x` + 64 hex is equally a transaction hash, and a base58 string is equally a public key,
+    so the site name is what decides and the name has to be a *whole* word — `monkey` ends in `key`."""
+
+    EVM = "0x" + "ab" * 32                       # 32 bytes, hex, 0x-prefixed
+    EVM_NO0X = "ab" * 32
+    SOL = "4p2M" + "n7Kd" * 21                   # 88 chars of base58, no 0/O/I/l
+    SOL_PUB = "4p2M" + "n7Kd" * 5 + "7"          # 32-44 chars: a public key, not a secret
+    SUI = "sui" + "privkey1" + "qprz" * 20 + "yd"
+    ARR = "[" + ", ".join(str(i * 4 % 256) for i in range(64)) + "]"
+    ALK = "Ab3d" + "Ef6gHi8jK0Lm2No4Pq6Rs8T"     # 28 chars, assembled like the rest
+    INF = "1p2q" + "3r4s5t6u7v8w9x0y1z2a3b4c"
+    QKN = "9f8e" + "7d6c5b4a39281706f5e4d3c2b1a0"
+    ANK = "0123" + "456789abcdef0123456789abcdef"
+    HEL = "a1b2" + "c3d4e5f60718293a4b5c6d7e8f90"
+
+    def blotted(self, line):
+        out, hits = blot.Blotter().blot_line(line)
+        self.assertTrue(hits, "not blotted: " + line)
+        return out
+
+    def test_a_hex_key_at_a_signer_name_is_blotted_by_default(self):
+        for name in ("deployer_key", "SIGNER_KEY", "pk", "user_pk", "sui_private", "eth-key",
+                     "my_signer", "validator_private", "WALLET_PK", "SIGNER_PK"):
+            out = self.blotted("%s=%s" % (name, self.EVM))
+            self.assertNotIn(self.EVM, out, "%s survived: %s" % (name, out))
+            self.assertIn("<EVMPRIVKEY:", out, "%s mislabelled: %s" % (name, out))
+
+    def test_a_name_kv_already_knows_keeps_the_generic_label(self):
+        # KV runs first on purpose. `API_KEY=0x…` is a named secret, and stamping it EVMPRIVKEY would
+        # claim which chain was leaked from a line that does not say. Vague beats wrong.
+        for name in ("PRIVATE_KEY", "private_key", "api_key", "API_KEY", "MNEMONIC", "secretKey"):
+            out = self.blotted("%s=%s" % (name, self.EVM))
+            self.assertNotIn(self.EVM, out, name + " survived")
+            self.assertNotIn("EVMPRIVKEY", out, "%s over-claimed: %s" % (name, out))
+
+    def test_a_name_that_merely_ends_in_the_letters_key_is_not_a_key_site(self):
+        for name in ("monkey", "donkey", "hockey", "turkey"):
+            line = "%s=%s" % (name, self.EVM)
+            self.assertEqual(blot.Blotter().blot_line(line)[0], line,
+                             "over-redacted %s=: a word is not a field name" % name)
+
+    def test_quoted_and_json_forms_of_the_same_site_blot(self):
+        for line in ['"private_key": "%s",' % self.EVM, "private_key: '%s'" % self.EVM,
+                    '{"PRIVATE_KEY":"%s"}' % self.EVM]:
+            out = self.blotted(line)
+            self.assertNotIn(self.EVM, out, out)
+
+    def test_a_suiprivkey_is_blotted(self):
+        out = self.blotted("sui key: " + self.SUI)
+        self.assertIn("<SUIPRIVKEY:", out, out)
+        self.assertNotIn(self.SUI, out, out)
+
+    def test_a_solana_base58_secret_key_is_blotted(self):
+        out = self.blotted("keypair " + self.SOL + " loaded")
+        self.assertIn("<SOLPRIVKEY:", out, out)
+        self.assertNotIn(self.SOL, out, out)
+
+    def test_a_solana_public_key_is_left_alone(self):
+        # 32-44 base58 characters is an address, and addresses are the thing a log is *about*.
+        line = "transfer to " + self.SOL_PUB + " confirmed"
+        self.assertEqual(blot.Blotter().blot_line(line)[0], line, "over-redacted an address")
+
+    def test_a_json_byte_array_keypair_at_a_key_site_is_blotted(self):
+        for name in ("secretKey", "private_key", "keypair", "wallet", "keystore"):
+            out = self.blotted('%s": %s' % (name, self.ARR))
+            self.assertNotIn("252, 44", out, "%s survived: %s" % (name, out))
+            self.assertIn("<SOLKEYJSON:", out, "%s mislabelled: %s" % (name, out))
+
+    def test_an_array_at_a_non_key_site_is_not_a_keypair(self):
+        for line in ["samples=" + self.ARR, "frame [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] dumped",
+                     "rgb=[240, 128, 64]"]:
+            self.assertEqual(blot.Blotter().blot_line(line)[0], line,
+                             "over-redacted an ordinary array: " + line)
+
+    def test_rpc_urls_lose_their_key_and_keep_their_host(self):
+        cases = [("https://eth-mainnet.g.alchemy.com/v2/" + self.ALK, "alchemy.com/v2/"),
+                 ("https://mainnet.infura.io/v3/" + self.INF, "infura.io/v3/"),
+                 ("https://solo.quiknode.pro/" + self.QKN, "quiknode.pro/"),
+                 ("https://rpc.ankr.com/solana/" + self.ANK, "ankr.com/solana/"),
+                 ("https://mainnet.helius-rpc.com/?api-key=" + self.HEL, "api-key=")]
+        for line, host in cases:
+            out = self.blotted(line)
+            key = line.rsplit("/", 1)[-1].split("=", 1)[-1]
+            self.assertNotIn(key, out, "%s survived: %s" % (host, out))
+            self.assertIn(host, out, "the host is what makes the line readable: " + out)
+
+    def test_a_keyless_rpc_url_is_untouched(self):
+        for line in ["https://eth-mainnet.g.alchemy.com/v2/",
+                     "https://rpc.ankr.com/solana",
+                     "https://api.mainnet-beta.solana.com",
+                     "https://mainnet.infura.io/v3/" + "e" * 12]:
+            out, _ = blot.Blotter().blot_line(line)
+            self.assertEqual(out, line, "over-redacted: " + out)
+
+    def test_etherscan_family_keys_at_an_apikey_site(self):
+        key = "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w"      # 31 chars, assembled like the rest
+        for line, name in [("https://api.etherscan.io/api?module=account&action=balance&apikey=" + key,
+                            "api.etherscan.io"),
+                           ("https://api.bscscan.com/api?apikey=" + key, "api.bscscan.com"),
+                           ("ETHERSCAN_API_KEY=" + key, "ETHERSCAN_API_KEY"),
+                           ("polygonscan_apikey: " + key, "polygonscan_apikey")]:
+            out = self.blotted(line)
+            self.assertNotIn(key, out, "%s survived: %s" % (name, out))
+            self.assertIn("<ETHERSCAN:", out, "%s mislabelled: %s" % (name, out))
+            self.assertIn(name.split("/")[0] if "http" in line else name, out,
+                            "the site must stay readable: " + out)
+
+    def test_a_short_apikey_value_is_not_claimed_by_the_family_rule(self):
+        # KV has long blotted `apikey=<5+ chars>` as a named secret, and that stays: this asserts the
+        # ETHERSCAN floor is not so low that a placeholder token gets reported as an Etherscan key.
+        line = "curl 'https://api.etherscan.io/api?apikey=short-token'"
+        out, hits = blot.Blotter().blot_line(line)
+        self.assertTrue(hits, "the name says apikey, so KV should still reach it")
+        self.assertNotIn("<ETHERSCAN:", out, "a 10-character value is not a 31-character key: " + out)
+
+    def test_these_reach_the_cli_without_extra_flags(self):
+        text = ("PRIVATE_KEY=%s\nsui=%s\n%s\nhttps://eth-mainnet.g.alchemy.com/v2/%s\n"
+                % (self.EVM, self.SUI, self.SOL, self.ALK))
+        rc, out, err = run("--quiet", "--verify", stdin=text)
+        self.assertEqual(rc, 0, out + err)
+        for secret in (self.EVM, self.SUI, self.SOL, self.ALK):
+            self.assertNotIn(secret, out, "%s survived to stdout" % secret[:12])
+
+
 class TestKeyNames(unittest.TestCase):
     """KV is a curated list of names, so the list has to cover the names people actually leak.
     Over-matching is a failure too, so both directions get asserted."""
@@ -686,6 +812,34 @@ class TestScreens(unittest.TestCase):
                   "SEED-PHRASE", "mnemonic_backup", "recovery-key"):
             cases.append('%s="witch collapse practice feed shame open despair"' % n)
             cases.append("%s: abandon, ability, able, above, absent, absorb" % n.upper())
+        # Chain keys: every branch of every name alternation, both ways a name can be written, and the
+        # two shapes that carry no name at all. A screen that is wrong in the loose direction loses a
+        # detector silently, and these are the rules whose screens are easiest to get wrong.
+        hexkey = "0x" + "cd" * 32
+        for n in ("DEPLOYER_KEY", "signer_key", "pk", "user_pk", "sui_private", "eth-key",
+                  "my_signer", "MNEMONIC", "validator_private", "WALLET_PK", "private_key",
+                  "API_KEY", "secretKey", "SIGNER_PK"):
+            cases.append("%s=%s" % (n, hexkey))
+        cases.append("sui key: " + "sui" + "privkey1" + "qprz" * 20)
+        cases.append("keypair " + "4p2M" + "n7Kd" * 21 + " loaded")
+        cases.append('secretKey": [' + ", ".join(str(i * 4 % 256) for i in range(64)) + "]")
+        cases += [
+            "https://eth-mainnet.g.alchemy.com/v2/" + "Ab3d" + "Ef6gHi8jK0Lm2No4Pq6Rs8T",
+            "https://mainnet.infura.io/v3/" + "1p2q" + "3r4s5t6u7v8w9x0y1z2a3b4c",
+            "https://solo.quiknode.pro/" + "9f8e" + "7d6c5b4a39281706f5e4d3c2b1a0",
+            "https://x.y.solana.mainnet.quiknode.pro/aaa/" + "9f8e" + "7d6c5b4a39281706f",
+            "https://rpc.ankr.com/solana/" + "0123" + "456789abcdef0123456789abcdef",
+            "https://mainnet.helius-rpc.com/?api-key=" + "a1b2" + "c3d4e5f60718293a4b5c6d7e8f90",
+            "https://api.etherscan.io/api?apikey=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "ETHERSCAN_API_KEY=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "polygonscan_apikey: " + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "https://api.bscscan.com/api?apikey=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "https://api.arbiscan.io/api?apikey=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "https://api.basescan.org/api?apikey=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "https://api.ftmscan.com/api?apikey=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "https://api.hecoinfo.com/api?apikey=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+            "https://api.snowtrace.io/api?apikey=" + "aB3dE5fG7hJ9kL1mN3oP5qR7sT9uV1w",
+        ]
         cases += ["nothing to see here, just a log line",
                   "commit 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8",
                   "GET /api/v1/users?page=2 200 14ms"]
