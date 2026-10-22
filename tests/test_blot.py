@@ -372,6 +372,87 @@ class TestPgpBlocks(unittest.TestCase):
         self.assertEqual([o for o, _ in outs], line.split("\n"), outs)
 
 
+class TestSeedPhrase(unittest.TestCase):
+    """A wallet seed is 12/15/18/21/24 words from one fixed 2048-word list. The detector had a ~50
+    word guess at that list, so a real mnemonic made of other words passed, and `mnemonic=<12 words>`
+    blotted exactly one word of it."""
+
+    SEED12 = ("abandon ability able about above absent absorb abstract absurd abuse access accident")
+    SEED24 = ("abandon ability able about above absent absorb abstract absurd abuse access accident "
+              "account accuse achieve acid acoustic acquire across act action actor actress actual")
+    # 10 of 12 from the list: the bar is "at least 80%", not "all of them", because a transcription
+    # with two words misread from a photo of a seed sheet is still a seed sheet.
+    MIX10 = ("abandon ability able about above absent absorb abstract absurd abuse witch least")
+    PROSE12 = "our vendor shipped a broken widget nobody could debug before the weekly release"
+
+    def test_the_wordlist_is_the_real_bip39_list(self):
+        self.assertEqual(len(blot.BIP39), 2048, "the list is not the BIP39 English list")
+        self.assertEqual(len(set(blot.BIP39)), 2048, "the list has duplicates")
+        self.assertEqual(blot.BIP39[0], "abandon")
+        self.assertEqual(blot.BIP39[-1], "zoo")
+
+    def test_a_bare_twelve_word_seed_is_one_secret(self):
+        out, hits = blot.Blotter().blot_line("backup " + self.SEED12 + " restored")
+        self.assertTrue(hits, "a 12-word run from the list was passed through")
+        self.assertIn("<SEEDPHRASE:", out)
+        for w in self.SEED12.split():
+            self.assertNotIn(w, out, "%s survived in %s" % (w, out))
+
+    def test_every_valid_phrase_length_is_recognised(self):
+        words = self.SEED24.split()
+        for n in (12, 15, 18, 21, 24):
+            out, hits = blot.Blotter().blot_line(" ".join(words[:n]))
+            self.assertTrue(hits, "%d-word phrase missed" % n)
+            self.assertIn("<SEEDPHRASE:", out)
+
+    def test_a_phrase_with_two_words_off_the_list_still_blots(self):
+        out, hits = blot.Blotter().blot_line(self.MIX10)
+        self.assertTrue(hits, "10/12 on the list is 83%, which is over the bar")
+        self.assertNotIn("witch", out, out)
+
+    def test_a_three_letter_list_word_does_not_break_the_run(self):
+        # BIP39 words run to three characters (`act`, `add`, `air`); the old {4,12} class cut a seed
+        # in half at the first one.
+        line = ("abandon ability able about above absent absorb abstract absurd abuse access act")
+        out, hits = blot.Blotter().blot_line(line)
+        self.assertTrue(hits, out)
+        self.assertNotIn("abandon", out, out)
+
+    def test_a_twelve_word_english_sentence_is_not_redacted(self):
+        out, hits = blot.Blotter(paranoid=True).blot_line(self.PROSE12)
+        self.assertEqual(out, self.PROSE12, "over-redacted ordinary prose")
+        self.assertFalse(hits, out)
+
+    def test_a_seed_site_consumes_the_whole_value_not_its_first_word(self):
+        # This is the shape from the report: `mnemonic=` followed by words that are mostly not on the
+        # list. The name says the field holds a phrase, so everything after it is the secret.
+        line = "mnemonic=witch collapse practice feed shame open despair creek road again ice least"
+        out, hits = blot.Blotter().blot_line(line)
+        self.assertTrue(hits)
+        for w in line.split("=")[1].split():
+            self.assertNotIn(w, out.split("=", 1)[1], "`%s` survived: %s" % (w, out))
+
+    def test_seed_mnemonic_and_recovery_names_all_take_the_phrase(self):
+        for name in ("seed", "mnemonic", "recovery_phrase", "recovery phrase", "seed_words",
+                     "SEED-PHRASE"):
+            line = '%s="correct horse battery staple purple giraffe"' % name
+            out, _ = blot.Blotter().blot_line(line)
+            self.assertNotIn("giraffe", out, "%s left the tail of the phrase: %s" % (name, out))
+            self.assertNotIn("staple", out, "%s left the tail of the phrase: %s" % (name, out))
+
+    def test_a_single_word_value_at_a_seed_site_still_blots(self):
+        out, hits = blot.Blotter().blot_line("mnemonic=witch")
+        self.assertTrue(hits, out)
+        self.assertNotIn("witch", out, out)
+
+    def test_the_repro_line_verifies_clean_after_redaction(self):
+        rc, out, err = run("--quiet", "--verify",
+                           stdin="mnemonic=" + " witch collapse practice feed shame open despair "
+                           "creek road again ice least\n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("despair", out, out)
+
+
 class TestKeyNames(unittest.TestCase):
     """KV is a curated list of names, so the list has to cover the names people actually leak.
     Over-matching is a failure too, so both directions get asserted."""
@@ -489,6 +570,13 @@ class TestScreens(unittest.TestCase):
                   "mnemonic", "recovery_phrase", "otp", "client_secret", "webhook_secret"):
             cases.append('%s="Sup3rS3cretValue"' % n)
             cases.append("%s: Sup3rS3cretValue" % n.upper())
+        # KVPHRASE's branches, each with a multi-word value: the screens claim for this rule is about
+        # the names, and every name in the alternation has to be exercised with a value that reaches
+        # the `sec` group.
+        for n in ("seed", "mnemonic", "recovery_phrase", "recovery phrase", "seed_words",
+                  "SEED-PHRASE", "mnemonic_backup", "recovery-key"):
+            cases.append('%s="witch collapse practice feed shame open despair"' % n)
+            cases.append("%s: abandon, ability, able, above, absent, absorb" % n.upper())
         cases += ["nothing to see here, just a log line",
                   "commit 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8",
                   "GET /api/v1/users?page=2 200 14ms"]
