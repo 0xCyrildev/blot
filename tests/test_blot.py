@@ -1,5 +1,6 @@
 """blot's own tests: every detector, and the four things that would make it dangerous to trust."""
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,11 @@ CLI = os.path.join(os.path.dirname(HERE), "blot.py")
 # the tests that exercise --map have to ask for a directory that is not one.
 TMP = tempfile.mkdtemp(prefix="blot-tests-")
 atexit.register(shutil.rmtree, TMP, True)
+# --stable keeps a key under $XDG_CONFIG_HOME/blot/stable.key. Redirected before anything runs so no
+# test can create, refuse on, or overwrite a file in the real home of whoever is running the suite —
+# and so the subprocesses below, which inherit this environment, stay inside TMP too.
+os.environ["XDG_CONFIG_HOME"] = TMP
+DEFAULT_STABLE_KEY = os.path.join(TMP, "blot", "stable.key")
 
 
 def scratch(name):
@@ -135,6 +141,109 @@ class TestConsistency(unittest.TestCase):
         b = blot.Blotter()
         out, _ = b.blot_line("password=hunter2supersecret")
         self.assertEqual(b.labels["hunter2supersecret"], out.split("=")[1])
+
+
+class TestStableKey(unittest.TestCase):
+    """--stable exists so one incident spread over five logs reads consistently. That needs the label
+    to be a function of the secret, which is also what let anyone holding the redacted text confirm a
+    guess offline: hash a candidate, compare the six hex digits. Unsalted sha1[:6] made every weak
+    secret in the report recoverable by dictionary. The fix is a key only the operator has."""
+
+    def keyfile(self, name, body=b"k" * 32, mode=0o600):
+        path = scratch(name)
+        with open(path, "wb") as fh:
+            fh.write(body)
+        os.chmod(path, mode)
+        return path
+
+    def read_bytes(self, path):
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def tag(self, out):
+        m = re.search(r"<[A-Z]+:([0-9a-f]+)>", out)
+        self.assertIsNotNone(m, "no stable label in: " + out)
+        return m.group(1)
+
+    def test_a_stable_tag_is_not_a_plain_hash_of_the_secret(self):
+        path = self.keyfile("_k_hash")
+        rc, out, err = run("--quiet", "--stable", "--stable-key", path, stdin="token " + GH + "\n")
+        self.assertEqual(rc, 0, out + err)
+        tag = self.tag(out)
+        self.assertEqual(len(tag), 8, "the tag is %r, not 8 hex characters" % tag)
+        for h in (hashlib.sha1, hashlib.sha256, hashlib.md5):
+            self.assertNotEqual(tag, h(GH.encode()).hexdigest()[:8],
+                                "the tag is a bare digest of the secret: a dictionary confirms it")
+
+    def test_the_key_is_what_makes_the_tag(self):
+        a = self.keyfile("_k_a", b"A" * 32)
+        b = self.keyfile("_k_b", b"B" * 32)
+        _rc1, out1, _e1 = run("--quiet", "--stable", "--stable-key", a, stdin="token " + GH + "\n")
+        _rc2, out2, _e2 = run("--quiet", "--stable", "--stable-key", b, stdin="token " + GH + "\n")
+        self.assertNotEqual(self.tag(out1), self.tag(out2),
+                            "two keys, same tag: the key is not being mixed in")
+
+    def test_one_key_agrees_across_separate_processes(self):
+        path = self.keyfile("_k_same")
+        _r1, o1, _e1 = run("--quiet", "--stable", "--stable-key", path, stdin="token " + GH + "\n")
+        _r2, o2, _e2 = run("--quiet", "--stable", "--stable-key", path,
+                           stdin="retried with " + GH + "\n")
+        self.assertEqual(self.tag(o1), self.tag(o2), "%s vs %s" % (o1, o2))
+
+    def test_the_default_key_is_created_private_and_never_regenerated(self):
+        if os.path.exists(DEFAULT_STABLE_KEY):
+            os.remove(DEFAULT_STABLE_KEY)
+        rc, out, err = run("--quiet", "--stable", stdin="token " + GH + "\n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.exists(DEFAULT_STABLE_KEY), "no key at the documented path")
+        self.assertEqual(oct(os.stat(DEFAULT_STABLE_KEY).st_mode)[-3:], "600")
+        first = self.read_bytes(DEFAULT_STABLE_KEY)
+        _r2, out2, _e2 = run("--quiet", "--stable", stdin="token " + GH + "\n")
+        self.assertEqual(self.read_bytes(DEFAULT_STABLE_KEY), first, "the key was rewritten")
+        self.assertEqual(self.tag(out), self.tag(out2), "the run after creation disagrees")
+
+    def test_a_shared_key_is_refused_rather_than_trusted(self):
+        path = self.keyfile("_k_open", mode=0o644)
+        rc, out, err = run("--quiet", "--stable", "--stable-key", path, stdin="token " + GH + "\n")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("600", err, err)
+        rc2, _o2, err2 = run("--quiet", "--force", "--stable", "--stable-key", path,
+                             stdin="token " + GH + "\n")
+        self.assertEqual(rc2, 0, out + err2)
+
+    def test_a_short_key_is_refused(self):
+        path = self.keyfile("_k_short", body=b"abc")
+        rc, out, err = run("--quiet", "--stable", "--stable-key", path, stdin="token " + GH + "\n")
+        self.assertEqual(rc, 2, out + err)
+        self.assertNotIn("<", out, "a weak key was used anyway: " + out)
+
+    def test_a_named_key_is_created_with_its_parent_directories(self):
+        path = os.path.join(TMP, "nested", "deeper", "stable.key")
+        rc, out, err = run("--quiet", "--stable", "--stable-key", path, stdin="token " + GH + "\n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.exists(path), err)
+        self.assertEqual(oct(os.stat(path).st_mode)[-3:], "600")
+
+    def test_stable_still_verifies(self):
+        path = self.keyfile("_k_verify")
+        rc, out, err = run("--stable", "--stable-key", path, "--verify",
+                           stdin="token " + GH + "\npassword=hunter2supersecret\n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("verify OK", err)
+
+    def test_the_help_says_what_the_key_costs(self):
+        rc, out, _err = run("--help")
+        self.assertEqual(rc, 0)
+        self.assertIn("--stable-key", out)
+        for word in ("key", "hash"):
+            self.assertIn(word, out.lower(), "--help must name the trade-off")
+
+    def test_a_library_caller_gets_the_default_key_too(self):
+        if os.path.exists(DEFAULT_STABLE_KEY):
+            os.remove(DEFAULT_STABLE_KEY)
+        one = blot.Blotter(stable=True).blot_line("t=" + GH)[0]
+        two = blot.Blotter(stable=True).blot_line("Authorization: " + GH)[0]
+        self.assertEqual(self.tag(one), self.tag(two))
 
 
 class TestFalsePositives(unittest.TestCase):

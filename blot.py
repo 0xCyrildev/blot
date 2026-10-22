@@ -27,6 +27,7 @@ streamed, so memory tracks how many secrets a run found rather than how large th
 """
 import argparse
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -573,12 +574,68 @@ def luhn(digits):
     return total % 10 == 0
 
 
+STABLE_KEY_BYTES = 32
+STABLE_KEY_MIN_BYTES = 16
+STABLE_TAG_HEX = 8
+
+
+def stable_key_path(override=None):
+    """Where the --stable key lives: --stable-key, else $XDG_CONFIG_HOME/blot/stable.key."""
+    if override:
+        return os.path.expanduser(override)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "blot", "stable.key")
+
+
+def load_stable_key(path, force=False):
+    """Read the HMAC key behind --stable, generating one on first use. Returns (key, created, error).
+
+    Refusing is the default wherever the alternative is a quietly weaker label. A group-readable key
+    hands the label→secret dictionary to whoever can read that directory, which is the exact property
+    an unsalted hash used to give away; a short key is one brute-force away from the same place. Both
+    are worth an error message over a silent degradation."""
+    try:
+        with open(path, "rb") as fh:
+            key = fh.read().strip()
+            mode = os.fstat(fh.fileno()).st_mode & 0o777
+    except FileNotFoundError:
+        key = os.urandom(STABLE_KEY_BYTES)
+        parent = os.path.dirname(path) or "."
+        try:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            return None, False, "cannot create the --stable key at %s: %s" % (
+                path, getattr(exc, "strerror", None) or exc)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
+        return key, True, None
+    except OSError as exc:
+        return None, False, "%s: %s" % (path, getattr(exc, "strerror", None) or exc)
+    if not force and (mode & 0o077):
+        return None, False, (
+            "%s: the --stable key is mode %03o. Whoever can read it can rebuild, for any guess they "
+            "like, the label that guess produces — which is the property --stable is meant to keep for "
+            "you alone. chmod 600 it, or pass --force on a box with no real permissions."
+            % (path, mode))
+    if len(key) < STABLE_KEY_MIN_BYTES:
+        return None, False, ("%s: the --stable key is %d bytes. Under %d it is a guess away from being "
+                             "found and --stable becomes decoration."
+                             % (path, len(key), STABLE_KEY_MIN_BYTES))
+    return key, False, None
+
+
 class Blotter:
     """One Blotter per run: the label table lives here, which is what makes redaction consistent."""
 
     def __init__(self, stable=False, keep=(), pii=False, paranoid=False, screen=True, rules=None,
-                 candidates=False):
+                 candidates=False, stable_key=None):
         self.stable = stable
+        if stable and stable_key is None:
+            stable_key, _created, err = load_stable_key(stable_key_path())
+            if err:
+                raise InputError(err)
+        self.stable_key = stable_key
         self.keep = {k.upper() for k in keep}
         self.pii = pii
         self.paranoid = paranoid
@@ -612,7 +669,12 @@ class Blotter:
         if secret in self.labels:
             return self.labels[secret]
         if self.stable:
-            tag = hashlib.sha1(secret.encode("utf-8", "replace")).hexdigest()[:6]
+            # Keyed, not a bare digest: `<KV:bfd361>` from unsalted sha1[:6] was a confirmation
+            # oracle, one candidate string per dictionary entry with nothing to hide the match. HMAC
+            # over the same secret with a key only the operator holds keeps the labels consistent
+            # across runs and unbuildable from the redacted text alone.
+            tag = hmac.new(self.stable_key, secret.encode("utf-8", "replace"),
+                           hashlib.sha256).hexdigest()[:STABLE_TAG_HEX]
         else:
             self._n[typ] = self._n.get(typ, 0) + 1
             tag = str(self._n[typ])
@@ -1071,12 +1133,24 @@ def main(argv=None):
     ap.add_argument("--verify", action="store_true",
                     help="re-scan the produced text; exit 3 if anything recognisable survived")
     ap.add_argument("--stable", action="store_true",
-                    help="derive labels from the secret's hash so the same token gets the same label "
-                         "across SEPARATE runs (default numbering is per-run)")
+                    help="label each secret from HMAC-SHA256 over it with a private key, so the same "
+                         "token gets the same label across SEPARATE runs (default numbering is "
+                         "per-run). The key is what makes that safe: an unsalted hash of the secret "
+                         "alone lets anyone holding the redacted text confirm a guess offline — one "
+                         "candidate, one digest, compare — which leaves a weak secret as good as "
+                         "published. Consistency you can rely on, opacity nobody else gets. Lose the "
+                         "key and every label changes; leak it and you have handed out the "
+                         "dictionary. See --stable-key.")
+    ap.add_argument("--stable-key", metavar="FILE",
+                    help="key file for --stable (default $XDG_CONFIG_HOME/blot/stable.key, or "
+                         "~/.config/blot/stable.key). Created 0600 on first use; a file that already "
+                         "exists is refused if group- or world-readable, or if it is under 16 bytes, "
+                         "unless --force")
     ap.add_argument("--map", dest="mapfile", metavar="FILE",
                     help="write the reverse table here, mode 0600 — this file holds every secret")
     ap.add_argument("--force", action="store_true",
-                    help="let --map replace an existing file, or land inside a git work tree")
+                    help="let --map replace an existing file or land inside a git work tree, and let "
+                         "a group- or world-readable --stable key be read anyway")
     ap.add_argument("--keep", action="append", default=[], metavar="TYPE",
                     help="do not blot this type (repeatable)")
     ap.add_argument("--pii", action="store_true", help="also blot emails, IPv4 addresses, phone numbers")
@@ -1145,7 +1219,18 @@ def main(argv=None):
                          "--help\n" % PROG)
         return 2
 
-    b = Blotter(stable=a.stable, keep=[k.upper() for k in a.keep], pii=a.pii,
+    stable_key = None
+    if a.stable:
+        stable_key, created, err = load_stable_key(stable_key_path(a.stable_key), a.force)
+        if err:
+            sys.stderr.write("%s: %s\n" % (PROG, err))
+            return 2
+        if created and not a.quiet:
+            sys.stderr.write("%s: created a new --stable key at %s (0600). Publish that file and the "
+                             "labels in this report are a lookup table; delete it and they all "
+                             "change.\n" % (PROG, stable_key_path(a.stable_key)))
+
+    b = Blotter(stable=a.stable, stable_key=stable_key, keep=[k.upper() for k in a.keep], pii=a.pii,
                 paranoid=a.paranoid, rules=custom, candidates=a.candidates or a.json or a.strict)
     err = preflight(a.files)
     if err:
