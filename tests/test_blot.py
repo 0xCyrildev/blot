@@ -246,6 +246,37 @@ class TestStableKey(unittest.TestCase):
         self.assertEqual(self.tag(one), self.tag(two))
 
 
+    def test_a_key_file_reads_back_exactly_as_it_was_written(self):
+        # The branch that creates the key returns the bytes it generated; the branch that reads it
+        # returns what is on disk. When the read trimmed, any random key ending in a whitespace byte
+        # made the creating run label with 32 bytes and every later run with 31, so --stable
+        # disagreed with itself, and CI caught it on one Python version out of four.
+        path = os.path.join(TMP, "boundary", "stable.key")
+        for i in range(200):
+            if os.path.exists(path):
+                os.remove(path)
+            made, created, err = blot.load_stable_key(path)
+            self.assertIsNone(err, "iteration %d" % i)
+            self.assertTrue(created)
+            reread, _created_again, err2 = blot.load_stable_key(path)
+            self.assertIsNone(err2, "iteration %d" % i)
+            self.assertEqual(made, reread,
+                             "iteration %d: a created key does not read back as itself" % i)
+
+    def test_a_key_ending_in_a_whitespace_byte_is_not_shortened(self):
+        path = os.path.join(TMP, "boundary2", "stable.key")
+        _k, _c, err = blot.load_stable_key(path)
+        self.assertIsNone(err)
+        with open(path, "wb") as fh:
+            fh.write(b"m" * 31 + b"\n")
+        read, _c2, err2 = blot.load_stable_key(path)
+        self.assertIsNone(err2)
+        self.assertEqual(read, b"m" * 31 + b"\n", "the trailing byte was trimmed off the key")
+        one = blot.Blotter(stable=True, stable_key=read).blot_line("token " + GH)[0]
+        two = blot.Blotter(stable=True, stable_key=b"m" * 31 + b"\n").blot_line("token " + GH)[0]
+        self.assertEqual(self.tag(one), self.tag(two))
+
+
 class TestFalsePositives(unittest.TestCase):
     def test_a_git_sha_is_not_a_secret_even_when_paranoid(self):
         b = blot.Blotter(paranoid=True)

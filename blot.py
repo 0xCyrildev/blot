@@ -680,7 +680,12 @@ def load_stable_key(path, force=False):
     are worth an error message over a silent degradation."""
     try:
         with open(path, "rb") as fh:
-            key = fh.read().strip()
+            # Read verbatim. The branch that creates the key returns the bytes it generated, so
+            # trimming here (`.strip()`, it used to be) made the two paths disagree about the key for
+            # any random 32 bytes ending in a whitespace value: the run that created the file labelled
+            # with 32 bytes and every run after it with 31, so `--stable` disagreed with itself from
+            # the first second, which is the one property it exists to have.
+            key = fh.read()
             mode = os.fstat(fh.fileno()).st_mode & 0o777
     except FileNotFoundError:
         key = os.urandom(STABLE_KEY_BYTES)
