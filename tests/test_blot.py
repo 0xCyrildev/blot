@@ -621,6 +621,16 @@ class TestWeb3(unittest.TestCase):
         self.assertIn("<SOLPRIVKEY:", out, out)
         self.assertNotIn(self.SOL, out, out)
 
+    def test_a_base58_key_on_a_line_with_no_screen_literal_is_still_found(self):
+        # SOLPRIVKEY cannot carry a screen: a run of 87 base58 characters is the whole evidence and no
+        # literal inside it is necessary. The whole-line shortcut would therefore skip it on every line
+        # that does not also happen to mention a key, which is how a detector dies — quietly, green.
+        line = "restored backup of " + self.SOL
+        self.assertIsNone(blot.SCREEN_ANY.search(line.lower()),
+                          "the fixture started matching a screen; the gate is no longer being tested")
+        self.assertEqual(blot.Blotter().blot_line(line), blot.Blotter(screen=False).blot_line(line))
+        self.assertIn("<SOLPRIVKEY:", blot.Blotter().blot_line(line)[0])
+
     def test_a_solana_public_key_is_left_alone(self):
         # 32-44 base58 characters is an address, and addresses are the thing a log is *about*.
         line = "transfer to " + self.SOL_PUB + " confirmed"
@@ -1271,6 +1281,98 @@ class TestAgentSurface(unittest.TestCase):
             self.assertIn("<STRIPE:1>", out2)
         finally:
             os.remove(path)
+
+
+ADVERSARIAL = (
+    "a", "ab", "0x" + "cd", "k" + "=", "password=" + "x", "https://" + "a" * 60 + "/",
+    "key=", "aaaaaaaaaaaaaaaaaaaaaaaa!", "-----BEGIN PRIVATE KEY-----" + "A", "1qaz" + "2wsx",
+)
+
+
+def adversarial_lines(count=5000):
+    """Ten shapes, each padded to exactly `count` characters, chosen because each one is a repeated
+    group some pattern has to try at every position: a long lowercase run (the bait for a star that can
+    split it zero-width), a long hex run, runs of separators, a URL with no dot, a PEM marker glued to
+    base64, and an `!` ending a run of a's — the textbook `(a+)+b` input."""
+    return [(seed * 600)[:count].ljust(count, "Z")[:count] for seed in ADVERSARIAL]
+
+
+class TestRegexLinearity(unittest.TestCase):
+    """probe_rule grows to 26 characters. The name-site guard that hung the process on a 64-hex key
+    was invisible at 26 and took longer than the rest of the suite combined at 32, so the built-ins get
+    measured at the length a real log line reaches, one rule at a time so a failure names the rule."""
+
+    def test_every_built_in_regex_is_linear_on_a_5000_character_line(self):
+        lines = adversarial_lines()
+        started = time.monotonic()
+        worst = (0.0, None, None)
+        for name, rx, _screen in list(blot.RULES) + list(blot.PII):
+            for i, line in enumerate(lines):
+                t = time.monotonic()
+                rx.search(line)
+                spent = time.monotonic() - t
+                if spent > worst[0]:
+                    worst = (spent, name, i)
+                self.assertLess(spent, 0.2, "%s took %.3fs on adversarial line %d (%r…): the pattern "
+                                            "is not linear in the input" % (name, spent, i, line[:20]))
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "the whole sweep took over a second; worst was %s on line %s at %.3fs"
+                        % (worst[1], worst[2], worst[0]))
+
+    def test_the_blowup_input_specifically(self):
+        # The exact shape that hung the first guard: a name site followed by a long run that cannot
+        # end in any of the tokens. Kept separate because the sweep above would time out at the same
+        # rule and say "not linear" without naming why.
+        rx = dict((t, r) for t, r, _s in blot.RULES)["SOLKEYJSON"]
+        for n in (64, 512, 4096):
+            line = '"private_key": "%s",' % ("0x" + "ab" * (n // 2))
+            t = time.monotonic()
+            rx.search(line)
+            self.assertLess(time.monotonic() - t, 0.1, "SOLKEYJSON blew up at %d characters" % n)
+
+
+class TestNegatives(unittest.TestCase):
+    """Each of these is a shape a detector wants to eat, and the cost of eating one is a report nobody
+    can use. They are pinned together because the failure is always the same one: confident
+    over-redaction looks exactly like a job well done."""
+
+    PROSE12 = "our vendor shipped a broken widget nobody could debug before the weekly release"
+
+    def test_the_default_redactor_leaves_every_one_of_these_alone(self):
+        hexkey = "0x" + "ab" * 32
+        for line in [
+            "commit 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8",
+            "bypass: 123456789",
+            "footprint=1234567890",
+            "compass: 123456789",
+            "monkey=" + hexkey,
+            "donkey=" + "f" * 64,
+            "monkey_key=banana",
+            "keyword=whatever12345",
+            "keys=[\"6tv7sUQqTg9rKpP1M3bXcVzNaLiJdEfGhIjKlMnOpQrSt\"]",
+            "primary_key=id",
+            "seedling=d2c1b0a9f8e7d6c5",
+            self.PROSE12,
+            "https://eth-mainnet.g.alchemy.com/v2/",
+            "https://rpc.ankr.com/solana",
+            "transfer to 4p2Mn7Kd2n7Kd3 done",
+        ]:
+            out, hits = blot.Blotter().blot_line(line)
+            self.assertEqual(out, line, "redacted a non-secret: " + out)
+            self.assertFalse(hits, "counted a hit on: " + line)
+
+    def test_paranoid_still_leaves_a_git_sha_and_plain_prose_alone(self):
+        for line in ["[detached 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8] commit "
+                     "4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8", self.PROSE12]:
+            out, _ = blot.Blotter(paranoid=True).blot_line(line)
+            self.assertEqual(out, line, "paranoid ate: " + out)
+
+    def test_verify_agrees_that_the_negatives_are_clean(self):
+        stdin = "\n".join(["commit 4f9a3cbe0a1d2b3c4d5e6f708192a3b4c5d6e7f8", "bypass: 123456789",
+                           "monkey=1234567890abcdef", self.PROSE12]) + "\n"
+        rc, out, err = run("--verify", stdin=stdin)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(out, stdin, "the default changed a line it should not have touched")
 
 
 class TestCli(unittest.TestCase):

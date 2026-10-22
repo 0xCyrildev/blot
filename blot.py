@@ -170,12 +170,13 @@ RULES = [
       "helius-rpc.com/?api-key=")),
     # The family is in the pattern, not inferred: `?apikey=<31 alnum>` on a host nobody has heard of is
     # not evidence that Etherscan was leaked. Etherscan and its forks all take the key in the query
-    # string, and the key is mixed-case alphanumerics with no prefix to screen on.
+    # string, and the key is mixed-case alphanumerics with no prefix to screen on. Both spans around the
+    # family name are bounded: an unbounded `[\w.-]*` prefix retried over a 5000-character word, once
+    # per position, and the sweep in TestRegexLinearity measured it at a third of a second per line.
     ("ETHERSCAN", re.compile(
-        r"(?i)(?P<keep>(?:https?://)?(?:[a-z0-9.\-]*[.\-])?(?:%s)(?:\.[a-z]{2,})?(?:/api)?"
-        r"(?:[\w=?&+.\%%\-]*[&?])?[_.\-]?api[_-]?key\s*[:=]\s*)"
-        r"(?P<sec>[A-Za-z0-9]{24,40})" % "|".join(RPC_FAMILIES)),
-     RPC_FAMILIES),
+        r"(?i)(?P<keep>(?:https?://)?[^\s\"'`]{0,40}?(?:%s)[^\s\"'`]{0,40}?api[_-]?key\s*[:=]\s*)"
+        r"(?P<sec>[A-Za-z0-9]{24,40})" % "|".join(RPC_FAMILIES),
+     ), RPC_FAMILIES),
     # Sui writes a secret key as a bech32 string: `suiprivkey1` then the 32-character data alphabet.
     # No boundary guard on purpose — a key concatenated onto other text is still the key, and forcing
     # a boundary would turn a miss into a leak.
@@ -880,8 +881,11 @@ class Blotter:
                 out = out[:a] + lab + out[b:]
                 hits += 1
         low = out.lower()
+        # The `len` test is not a heuristic: a run of 87 characters cannot exist in a shorter line, so
+        # on an ordinary timestamped log — where most lines are shorter than that — the gate is a
+        # comparison instead of a regex pass over the whole line.
         if (not self.screen or self._prefilter is None or self._prefilter.search(low)
-                or SOL_BASE58_GATE.search(out)):
+                or (len(out) >= 87 and SOL_BASE58_GATE.search(out))):
             for typ, rx, screen in self.rules:
                 if typ in self.keep:
                     continue
