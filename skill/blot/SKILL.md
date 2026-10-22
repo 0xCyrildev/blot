@@ -62,8 +62,11 @@ step 3.
 - `--pii` — emails, IPv4, phone numbers too.
 - `--paranoid` — blot any high-entropy value sitting at a key, quote or `--flag=` site. Use it when
   the text matters less than the secrets, and expect it to eat useful lines.
-- `--stable` — labels derived from the secret's hash, so the same token gets the same label across
-  separate runs. Needed when one incident spans several logs.
+- `--stable` — labels derived from HMAC-SHA256 of the secret under a key only you hold, so the same
+  token gets the same label across separate runs. Needed when one incident spans several logs. The key
+  lives at `~/.config/blot/stable.key`, created `0600` on first use; `--stable-key FILE` points at one
+  you manage (share it between the machines that must agree). Losing it changes every label; leaking it
+  turns the redacted text back into a lookup table — which is why an unsalted hash is not used.
 - `--map secrets.map.json` — the reverse table, `0600`, never overwritten. **This file is the only
   copy of what was removed.** Do not commit it, do not attach it, do not paste it into the issue.
 - `--keep TYPE` — spare a type. Names a rule, not a secret: a value can still be caught by another.

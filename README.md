@@ -37,9 +37,14 @@ blot --pii --paranoid build.log                         # emails/IPs, plus high-
 
 It knows AWS keys, GitHub/GitLab/npm/PyPI/Hugging Face/Cloudflare/Grafana/Sentry/SendGrid/Stripe/
 Slack/Discord/Twilio/Google-shaped tokens, JWTs, `Authorization:` headers, basic auth, cookies,
-`postgres://user:pass@host` URLs, PEM private key blocks (as one secret, not thirty), BIP39-shaped
-word runs, and a curated list of key names — `password`, `APP_KEY`, `SECRET_KEY_BASE`, `*_SECRET`,
-`*_TOKEN`. `blot --list-types` prints the lot; `--keep TYPE` spares one on purpose.
+`postgres://user:pass@host` URLs, PEM and PGP-private-key blocks (as one secret, not thirty, and a key
+that fits on one JSON line is still one secret), wallet seeds — the whole BIP39 English list, not a
+guess at it — and chain credentials: `0x`+64 hex at a `*_KEY`/`*_PK`/`*_SIGNER`/`*_DEPLOYER` site,
+`suiprivkey1…`, 87-88-character Solana base58 secret keys, JSON byte-array keypairs, Etherscan-family
+`apikey=`, and RPC URLs with the key inside them (`alchemy.com/v2/`, `infura.io/v3/`, `quiknode.pro/`,
+`ankr.com/<net>/`, `helius-rpc.com/?api-key=`). A Solana *address* is left in place, because that is
+what the log is about. Plus a curated list of key names — `password`, `APP_KEY`, `SECRET_KEY_BASE`,
+`*_SECRET`, `*_TOKEN`. `blot --list-types` prints the lot; `--keep TYPE` spares one on purpose.
 
 ## The long tail, and the agent that closes it
 
@@ -93,15 +98,25 @@ What is still true:
   catches the next `footprint=`; nothing catches a value that looks exactly like the text around it.
 - **Over-redaction is a failure too,** and the answer is a trade rather than a solution: the key-name
   list is curated rather than `.*key.*=`, a git sha beside `commit` stays put, and `--paranoid` buys
-  reach with precision when you would rather lose the line than lose the token.
+  reach with precision when you would rather lose the line than lose the token. One chain-specific
+  example of the trade: an ed25519 secret key and a Solana *signature* are both 87-88 base58
+  characters and indistinguishable on the page, so both are blotted; addresses are spared because they
+  are 32-44 characters, nowhere near that length.
+- **A bare seed that is mostly English but not on the list is missed.** The membership bar is 80% of
+  BIP39, which is what keeps a twelve-word sentence in your report; a phrase under the bar is caught
+  when it sits at a `seed=`, `mnemonic=` or `recovery_phrase=` site, because there the name says what
+  the value is.
 - **`--map` is the only copy** of the label-to-secret table — 0600, never silently overwritten.
   Publish it and you have published everything.
+- **`--stable` is only as secret as its key file.** Labels are HMAC-SHA256 under
+  `~/.config/blot/stable.key` (`--stable-key` to move it); lose it and every label changes, leak it
+  and the labels in your report are a lookup table again.
 - Not a DLP, not a compliance scanner, not a substitute for rotating what you leaked.
 
 ## Develop
 
 ```sh
-python3 tests/test_blot.py    # 65 tests, stdlib only, no install step
+python3 tests/test_blot.py    # 126 tests, stdlib only, no install step
 ```
 
 MIT. If blot cost you a credential, the failure was the credential being there — but do open an
