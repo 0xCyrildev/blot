@@ -402,18 +402,31 @@ class Blotter:
             if PEM_END.search(line):
                 self._in_pem = False
             return "", self._pem_lines
-        m = PEM_BEGIN.search(line)
-        if m:
-            self._in_pem = True
-            self._pem_lines = 1
-            lab = self.label("PRIVKEY", "<pem-block>")
-            self._note("PRIVKEY", lab)
-            if not PEM_END.search(line):
-                return lab, 1
-            return lab + line[m.end():], 1
-
         out = line
         hits = 0
+        pos = 0
+        while True:
+            m = PEM_BEGIN.search(out, pos)
+            if not m:
+                break
+            lab = self.label("PRIVKEY", "<pem-block>")
+            self._note("PRIVKEY", lab)
+            hits += 1
+            end = PEM_END.search(out, m.end())
+            if end:
+                # Replace the block, not just its opening marker: inside JSON, an env var or a tfvars
+                # file the whole key sits on one line and BEGIN/END share it. The text around it is
+                # the reader's context and stays where it is.
+                out = out[:m.start()] + lab + out[end.end():]
+                pos = m.start() + len(lab)
+            else:
+                # Nothing after a BEGIN marker on its own line is prose — it is key material, and the
+                # block is still open. `_in_pem` is set only here, so a block that closed on this line
+                # cannot swallow the next one.
+                out = out[:m.start()] + lab
+                self._in_pem = True
+                self._pem_lines = 1
+                break
         sm = SEED_RUN.search(out)
         if sm:
             words = sm.group(0).split()

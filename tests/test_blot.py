@@ -280,6 +280,51 @@ class TestPII(unittest.TestCase):
         self.assertNotIn("user@example.com", out, out)
 
 
+class TestPemOneLine(unittest.TestCase):
+    """A key block whose BEGIN and END share a line is what a private key looks like inside JSON, an
+    env var or a tfvars file. The state machine was written for the multi-line case and got the
+    single-line one wrong in three ways at once."""
+
+    ONE = ('{"private_key": "-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkq\\n'
+           '-----END PRIVATE KEY-----\\n"}')
+
+    def test_a_one_line_block_loses_its_body_and_keeps_its_wrapping(self):
+        out, hits = blot.Blotter().blot_line(self.ONE)
+        self.assertTrue(hits)
+        self.assertNotIn("MIIEvQIBADANBgkq", out, out)
+        self.assertNotIn("-----END", out, out)
+        self.assertIn("<PRIVKEY:", out)
+        self.assertIn('{"private_key": "', out, "the JSON around the key is not the secret")
+
+    def test_a_one_line_block_does_not_swallow_the_next_line(self):
+        # Returning from the BEGIN branch without clearing the state left the run inside a block that
+        # had already closed, so every following line was deleted until the next -----END-----.
+        b = blot.Blotter()
+        first = b.blot_line(self.ONE)[0]
+        second = b.blot_line("this line must survive intact")[0]
+        self.assertNotIn("MIIE", first)
+        self.assertEqual(second, "this line must survive intact")
+
+    def test_two_blocks_on_one_line_are_both_gone(self):
+        line = ('a="-----BEGIN RSA PRIVATE KEY-----\\nQVFBQVFB\\n-----END RSA PRIVATE KEY-----\\n" '
+                'b="-----BEGIN EC PRIVATE KEY-----\\nU0VDUkVUCg==\\n-----END EC PRIVATE KEY-----\\n"')
+        out, hits = blot.Blotter().blot_line(line)
+        for body in ("QVFBQVFB", "U0VDUkVUCg=="):
+            self.assertNotIn(body, out, "body %s survived: %s" % (body, out))
+        self.assertGreaterEqual(hits, 2, out)
+
+    def test_the_opening_line_of_a_multiline_block_keeps_its_context(self):
+        out, _ = blot.Blotter().blot_line('key = "-----BEGIN PRIVATE KEY-----"')
+        self.assertTrue(out.startswith("key = "), out)
+        self.assertIn("<PRIVKEY:", out)
+
+    def test_a_closed_pem_reaches_the_cli(self):
+        rc, out, err = run("--quiet", "--verify", stdin=self.ONE + "\nafter the block\n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("MIIEvQIBADANBgkq", out, out)
+        self.assertIn("after the block", out, "the run swallowed the line after a closed block")
+
+
 class TestKeyNames(unittest.TestCase):
     """KV is a curated list of names, so the list has to cover the names people actually leak.
     Over-matching is a failure too, so both directions get asserted."""
