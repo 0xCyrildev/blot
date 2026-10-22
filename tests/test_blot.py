@@ -179,6 +179,26 @@ class TestVerify(unittest.TestCase):
         self.assertLess(time.time() - t, 3.0, "one 240 KB log line took too long")
 
 
+class TestVerifyLineGranularity(unittest.TestCase):
+    """verify decides per line. A placeholder on a line is evidence that the line was *worked on*,
+    not that it was finished — the exemption that read it the other way round certified a line
+    carrying both `<KV:1>` and a live GitHub token as clean."""
+
+    BOTH = "a=" + GH + " password=hunter22\n"
+
+    def test_a_placeholder_does_not_exempt_the_live_secret_next_to_it(self):
+        rc, out, err = run("--quiet", "--keep", "GHTOKEN", "--verify", stdin=self.BOTH)
+        self.assertEqual(rc, 3, out + err)
+        self.assertIn("NOT CLEAN", err)
+        self.assertIn(GH, out, "the fixture stopped leaking, which would make the rc=3 vacuous")
+
+    def test_a_fully_blotted_line_still_verifies_clean(self):
+        rc, out, err = run("--verify", stdin=self.BOTH)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn(GH, out)
+        self.assertNotIn("hunter22", out)
+
+
 class TestKeyNames(unittest.TestCase):
     """KV is a curated list of names, so the list has to cover the names people actually leak.
     Over-matching is a failure too, so both directions get asserted."""

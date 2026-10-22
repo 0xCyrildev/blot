@@ -694,8 +694,11 @@ def redact_stream(blotter, files, dest, check=None, discard=False):
             sink.write(text)
             first, last = False, text
             if check is not None and text:
-                if ((check.blot_line(text)[1] and not LABEL_INNER.search(text))
-                        or LABEL_TAIL.search(text)):
+                # No line-level "this line already has a placeholder on it" exemption: `_apply`
+                # refuses to blot inside a label per match, which is what stops a re-scan from
+                # chewing up its own output. The older guard read a placeholder as proof the whole
+                # line was finished, so a kept secret sharing a line with any label passed verify.
+                if check.blot_line(text)[1] or LABEL_TAIL.search(text):
                     bad.append(blotter._lineno)
         if last:
             sink.write("\n")
